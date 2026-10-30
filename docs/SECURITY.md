@@ -12,7 +12,8 @@ profile at any time.**
 | --- | --- | --- |
 | API keys, usernames, user ids, custom User-Agents | `chrome.storage.local` → key `bsm.servers`, inside the `ServerConfig` records | Never `chrome.storage.sync`, so keys are not uploaded to a Google account and do not travel between devices |
 | Settings (templates, toggles, intervals) | `chrome.storage.local` → `bsm.settings` | No secrets here |
-| Queue state | `chrome.storage.local` → `bsm.queue` | Post ids and statuses only — no credentials |
+| Queue state | `chrome.storage.local` → `bsm.queue` | Post ids and statuses; link rows also retain complete external URLs, potentially including share keys |
+| Collected links and task membership | `chrome.storage.local` → `bsm.links`, `bsm.tasks` | Link URLs can contain bearer tokens or decryption keys, including Mega fragments |
 | Schema/meta (version, first run) | `chrome.storage.local` → `bsm.meta` | No secrets |
 
 `chrome.storage.local` is readable by this extension only (not by web pages), and
@@ -63,7 +64,8 @@ These are hard rules for the codebase (any change that breaks them is a bug):
 2. `HttpClient` snapshots and events are redacted at the source:
    `redactUrl()` replaces the values of `api_key`, `apikey`, `key`, `login`,
    `password`, `password_hash`, `token`, `access_token`, `user_id` and `_client`
-   with `***`, and strips any `user:password@` userinfo. `redactHeaders()` masks
+   with `***`, masks Pawchive signed `s` values and URL fragments, and strips any
+   `user:password@` userinfo. `redactHeaders()` masks
    `Authorization`, `Cookie`, `X-API-Key`.
 3. Validation results carry a redacted `trace` (`ProbeTraceEntry`) with the
    redacted request URL, status, duration and interpretation — that trace is what
@@ -116,8 +118,10 @@ the page's own DOM script state.
   echo the configured User-Agent strings. Those strings identify the account you
   configured, which is exactly what e621/Danbooru policy asks for; keep API keys out
   of the User-Agent field.
-- **Exported files are outside our control.** An export that includes secrets is a
-  plaintext file; store it accordingly or prefer the secret-free export.
+- **Exported files are outside our control.** A server export including credentials
+  is plaintext. Collected-link text and task exports intentionally preserve full
+  URLs, including Mega decryption keys and other bearer tokens, even when server
+  credentials are excluded; share and store those packages carefully.
 - **The preview harness is development-only.** It uses demo credentials and
   `localStorage`; never put real keys into it.
 - **Site terms still apply.** The extension enforces documented request rates and a
@@ -142,7 +146,7 @@ worker as every other surface.
   `hasApiKey`) and export/import flows to the options page, which owns the reveal
   and export controls.
 - It performs no network I/O: fetches go through `browse/search` (which applies the
-  rating allow-list and the tag blacklist in the router) and downloads through the
+  rating allow-list and the booru tag blacklist in the router (Pawchive has neither)) and downloads through the
   queue.
 - The download notebook (`bsm.history`) stores labels, ids, filenames, byte counts
   and timestamps - never URLs with credentials, never API keys. `Reset download

@@ -68,7 +68,7 @@ Droidbooru_2_0_9_apk/
 | `ServerItemTypeDanbooru` (Danbooru 1 / Moebooru) | `src/adapters/moebooru.ts` (yande.re, konachan) | yande.re `/post.json` |
 | `ServerItemTypeDerpibooru` | `src/adapters/philomena.ts` (derpibooru, furbooru, ponybooru) | derpibooru `/api/v1/json/search/images` |
 | `ServerItemTypeHydrus` | `src/adapters/hydrus.ts` | per Client API docs (local only, not reachable from the sandbox) |
-| `ServerItemTypeKemono` | `src/adapters/kemono.ts` (kemono, coomer) | kemono.cr `/api/v1/posts` |
+| `ServerItemTypeKemono` | Historical port removed; only the separate Pawchive creator-archive adapter remains | — |
 
 Not ported, on purpose: `IBSearch` (site is gone), `Shimmie`, `ZeroChan`
 (HTML scraping via Jsoup - no stable API), `BooruIO` (tiny, unverified),

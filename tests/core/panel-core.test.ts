@@ -166,6 +166,8 @@ describe('download history', () => {
       postUrl: 'https://e621.net/posts/1500000',
       bytes: 524288,
       at: new Date('2024-05-06T07:08:09.000Z').toISOString(),
+      quality: 'original',
+      completion: 'browser-complete',
       ...overrides,
     };
   }
@@ -253,7 +255,7 @@ describe('panel settings keys', () => {
     expect(settings.uiMode).toBe('sidepanel');
     expect(settings.panelDefaultTab).toBe('browse');
     expect(settings.mediaFilter).toBe('all');
-    expect(settings.skipDownloaded).toBe(true);
+    expect(settings.skipDownloaded).toBe(false);
     expect(settings.pageRangeLimit).toBe(150);
     expect(settings.queueRowLimit).toBe(60);
     expect(settings.filePreference).toBe('original');

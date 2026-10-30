@@ -142,15 +142,32 @@ export function redactUrl(raw: string): string {
         touched = true;
       }
     }
+    // Pawchive temporary downloads use `s` as a bearer signature. Do not
+    // redact generic `s` parameters globally: booru DAPI uses `s=post`.
+    if (/(?:^|\.)pawchive\.(?:pw|st)$/i.test(url.hostname) && url.searchParams.has('s')) {
+      url.searchParams.set('s', '***');
+      touched = true;
+    }
     if (url.username || url.password) {
       url.username = '';
       url.password = '';
       touched = true;
     }
+    // Share-link fragments can be bearer/decryption keys. Exported links keep
+    // them, but diagnostics and logs must never expose them.
+    if (url.hash) {
+      url.hash = '#***';
+      touched = true;
+    }
     return touched ? url.toString() : raw;
   } catch {
-    return raw.replace(/([?&](?:api_key|apikey|login|password_hash|token)=)[^&]*/gi, '$1***');
+    return raw.replace(/([?&](?:api_key|apikey|login|password_hash|token)=)[^&#]*/gi, '$1***').replace(/#.*/, '#***');
   }
+}
+
+/** Redact URL secrets when a browser/network error embeds a URL in free text. */
+export function redactUrlsInText(text: string): string {
+  return text.replace(/https?:\/\/[^\s<>"'`]+/gi, (url) => redactUrl(url));
 }
 
 /** Redact any credential-looking header values. */

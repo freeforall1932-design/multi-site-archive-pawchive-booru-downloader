@@ -15,9 +15,9 @@ collector (`0.2.x`).
 | Listing card: tag search with suggestions, page ranges (`2,4,6-10`, `50-`, `all`), crawl cap, progress, media filter | ✅ | `src/ui/panel-listing.ts`, `src/core/pages.ts` |
 | Review-then-download rows: a row *is* a persisted queue item, ticked selection, selective runs | ✅ | `src/ui/panel-queue.ts`, `queue/run { itemIds }`, `queue/remove` |
 | Settings in the NHentai-Downloader section style (heading + hint per option, template checkbox editor, live preview) | ✅ | `src/ui/settings-sections.ts`, `src/core/template.ts` |
-| Download history ("skip downloaded", `saved` badges) + remembered searches | ✅ | `src/core/history.ts`, `bsm.history`, `bsm.searches` |
-| Shared tag blacklist and "always append these tags" applied to every search | ✅ | `src/core/search.ts`, router `browse/search`, adapter `composeTags` |
-| Quality (original vs sample rendition) and duplicate behaviour on the dock/settings | ✅ | `settings.filePreference`, `settings.duplicateBehaviour`, queue + router download paths |
+| Browser-completion tracking for direct posts, queue and mirror/task downloads; confirmed-only history + remembered searches | ✅ | `src/core/history.ts`, `bsm.history`, `bsm.searches` |
+| Shared tag blacklist and "always append these tags" applied to booru searches (not Pawchive creator/title queries) | ✅ | `src/core/search.ts`, router `browse/search`, adapter `composeTags` |
+| Original-only downloads and duplicate behaviour on the dock/settings | ✅ | `src/core/downloads.ts`, normalized legacy settings, queue + router paths |
 | Multi-server / multi-account manager with mobile-style server list | ✅ | `src/ui/server-list.ts`, `src/options/options.ts` (`#servers`) |
 | Add/edit screen with per-site fields, validate-client, save | ✅ | `src/ui/server-form.ts`, `src/core/validation.ts` |
 | **e621 adapter** (first target) | ✅ | `src/adapters/e621.ts` |
@@ -27,7 +27,7 @@ collector (`0.2.x`).
 | Moebooru family: yande.re, konachan (`/post.json`, optional `login`+`password_hash`) | ✅ | `src/adapters/moebooru.ts` |
 | Philomena family: derpibooru, furbooru, ponybooru (comma query syntax, ratings as tags, filter pinning) | ✅ | `src/adapters/philomena.ts` |
 | Hydrus Client API (local http, access key, two-step listing → metadata) | ✅ | `src/adapters/hydrus.ts` |
-| Kemono / Coomer / Pawchive creator archives (attachment rows with composite ids, per-node file hosts) | ✅ | `src/adapters/kemono.ts` |
+| Pawchive creator archive (indexed attachment slots, signed/classic originals, preview/deferred handling, all-files queue action) | ✅ offline | `src/adapters/pawchive.ts`, `src/core/router.ts` |
 | **Mirror-link collector (Links tab)**: walks a creator's posts, harvests the off-site download links in their bodies, keeps them in a durable list, groups/ticks/queues them, exports and re-imports the list as `.txt` | ✅ | `src/core/links.ts`, `src/core/link-store.ts`, `src/ui/panel-links.ts`, `src/panel/panel.ts`, [docs/SIDEPANEL.md#links-tab-download-tasks](SIDEPANEL.md#links-tab-download-tasks) |
 | **Download tasks**: one task per creator (site + service + creator), files joined to it, per-file outcome, completion states (complete/partial/failed/in-progress), run history, *Download missing* (new + retries, never re-download), *Pause*, *Rescan* (incremental) | ✅ | `src/core/tasks.ts`, `src/core/task-store.ts`, `bsm.tasks`, `tasks/*` in `src/core/router.ts` |
 | **Task packages**: export writes the `.json` manifest *and* the grouped `.txt`; import reads either half (manifest, our `.txt`, a userscript export, a hand-written list) and merges into the existing task; nothing downloads on import | ✅ | `src/core/tasks.ts` (`formatTaskManifest`, `parseTaskPackage`), `src/core/router.ts` (`tasks/export`, `tasks/import`) |
@@ -41,16 +41,16 @@ collector (`0.2.x`).
 | Popup + content-script download button | ✅ | `src/popup/popup.ts`, `src/content/post-button.ts` |
 | Diagnostics + credential-free traces | ✅ | `src/ui/diagnostics-view.ts`, `src/core/router.ts` |
 | Offline preview harness + mock booru | ✅ | `dev/preview/`, `src/preview/`, `scripts/preview-server.mjs` |
-| Tests for adapters and shared logic | ✅ | `tests/` — 478 tests, all passing (incl. the mirror-link rules, the task/package round-trip and panel logic) |
+| Tests for adapters and shared logic | ✅ | `tests/` — automated tests (incl. the mirror-link rules, the task/package round-trip and panel logic) |
 | Docs | ✅ | `README.md`, `docs/{SIDEPANEL,ARCHITECTURE,ADAPTER_CONTRACT,SECURITY,MANUAL_TESTS,WORKLIST}.md`, `userscripts/README.md` |
 
 ### Verification snapshot
 
 ```
 npm run typecheck   → clean (src + tests, strict TS, noUncheckedIndexedAccess)
-npm test            → 478 passed (15 files)
+npm test            → offline adapter, core and panel suites pass
 npm run build       → dist/ with manifest, 4 icons, build-info.json
-npm run smoke       → 91/91 checks against the built dist/ bundle (incl. booting
+npm run smoke       → 94/94 checks against the built dist/ bundle (incl. booting
                       the built panel bundle, driving a query and a full
                       mirror-link collection through it, walking all five panel
                       tabs incl. Links, exporting a task package and reading it
@@ -61,8 +61,11 @@ npm run preview     → harness + side panel/options/popup served on :4173, with
 
 | Suite | Tests | Focus |
 | --- | --- | --- |
-| `tests/adapters/contract.test.ts` | 147 | cross-adapter invariants, automatically covers new adapters (incl. Pawchive) |
-| `tests/adapters/families.test.ts` | 35 | Moebooru, Philomena, Hydrus, Gelbooru forks and the Kemono family fixtures |
+| `tests/adapters/contract.test.ts` | 131 | cross-adapter invariants, automatically covers new adapters (incl. Pawchive) |
+| `tests/adapters/families.test.ts` | 25 | Moebooru, Philomena, Hydrus and Gelbooru fork fixtures |
+| `tests/adapters/pawchive.test.ts` | 12 | Pawchive hosts, URLs, attachment shapes, signatures and availability |
+| `tests/core/pawchive-scope.test.ts` | 16 | legacy profiles, retained boorus, task scope, text-only posts, pacing and preview history |
+| `tests/core/preview-media.test.ts` | 2 | local-only mock thumbnails and downloads |
 | `tests/adapters/e621.test.ts` | 26 | auth, requests, parsing, failure classification, routes, UA |
 | `tests/adapters/danbooru.test.ts` | 17 | same, plus `/profile.json` account parsing |
 | `tests/adapters/gelbooru.test.ts` | 24 | DAPI envelope, query-with-userid auth, fork factory |
@@ -70,15 +73,20 @@ npm run preview     → harness + side panel/options/popup served on :4173, with
 | `tests/core/links.test.ts` | 30 | link rules, payload extraction, export/import round-trip, store merge rules, `link` rows, the `links/*` flow |
 | `tests/core/tasks.test.ts` | 23 | task identity, statistics/completion, run planning, the package round-trip between two machines, pause/rescan, run history |
 | `tests/core/panel-core.test.ts` | 35 | page ranges, query composition, template editor, history notebooks, panel settings keys |
-| `tests/core/panel-router.test.ts` | 12 | selective runs, row removal, history/search messages, blacklist + suffix, sample/overwrite preferences |
-| `tests/core/http.test.ts` | 26 | rate limiter, retries, abort, redaction, JSON/HTML/empty bodies |
+| `tests/core/panel-router.test.ts` | 12 | selective runs, history/search messages, blacklist + suffix, legacy quality migration |
+| `tests/core/original-only.test.ts` | 25 | original vs sample selection across booru families, direct/queue paths, legacy settings/history |
+| `tests/core/pawchive-all-files.test.ts` | 6 | post all-file queueing, unavailable slots, changed hashes and old indices |
+| `tests/core/mega-links.test.ts` | 8 | keys, task/queue identity, exports, known share pages and redaction |
+| `tests/core/http.test.ts` | 27 | rate limiter, retries, abort, redaction, JSON/HTML/empty bodies |
 | `tests/core/queue.test.ts` | 13 | dedupe, rating enforcement, failures, pause/retry/clear, persistence |
+| `tests/core/download-completion.test.ts` | 22 | delayed completion, interruption, ID races, worker recovery, progress, cancellation, tasks, legacy records and MV3 listener wiring |
 | `tests/core/servers.test.ts` | 19 | CRUD, default rules, duplicate, masking, export/import |
 | `tests/core/validation.test.ts` | 19 | preflight, endpoint/auth/rate-limit/network classification, trace redaction |
 | `tests/core/naming.test.ts` | 17 | sanitisation, traversal, reserved names, tokens, length caps |
 
 All tests run offline against `src/preview/mock-booru.ts`; no live site is contacted
-by the suite. Live behaviour is covered by `docs/MANUAL_TESTS.md`.
+by the suite. `docs/MANUAL_TESTS.md` is a plan, not proof that live Pawchive
+has been tested for these changes.
 
 ## Behaviour notes worth knowing
 
@@ -91,25 +99,27 @@ by the suite. Live behaviour is covered by `docs/MANUAL_TESTS.md`.
   also starts the run.
 - **Newly listed rows arrive ticked**, and a row you untick stays unticked across
   refreshes (selection is reconciled against a snapshot of pending ids).
-- **The tag blacklist is applied in the router**, once, for every surface; the
+- **The tag blacklist is applied in the router**, once, for booru queries on every surface; the
   *global suffix* is applied by the adapters (which also de-duplicate it against
-  your own tags), so neither is ever added twice.
-- **`filePreference: 'sample'`** falls back to the original file whenever the site
-  reports no sample, so a download never fails because of a quality preference.
+  your own tags), so neither is ever added twice. Pawchive queries are not filtered by these booru rules.
+- **Original-only policy:** old `filePreference: 'sample'` is normalized to
+  `original`; missing originals and known reduced renditions fail rather than fall
+  back. Metadata-based selection is not checksum/content verification.
 - **A mirror link is a second kind of queue row.** It is keyed by its URL
   (`link:<url>`), skips the adapter, the post lookup and the rating filter, and is
   saved through the URL-shaped naming tokens (`mirrors/{host}` by default) - which
   is what makes an imported `.txt` work on a profile that has no server at all.
-  Hosting pages that need a login cannot be fetched by a browser download; the row
-  keeps the error and the exported `.txt` is the fallback for those.
+  Known provider share pages are rejected, with open/export as the fallback.
+  Unknown HTML interstitials cannot always be distinguished from direct files.
 - **Re-collecting a creator never duplicates work.** The link store merges by URL
   id and keeps an existing `done`/`failed` outcome, so a second scan of the same
   creator only refreshes the post context and reports duplicates.
 - **"Download missing" is the only bulk action a task needs.** It queues files
   that are `new` *and* files that `failed` - a retry is the same button - and
   never a file that is `done`. That is the whole re-run strategy: new posts appear
-  via *Rescan*, failures come back through the same press, and nothing already on
-  disk is fetched twice.
+  via *Rescan*; interrupted and unverified attempts are retryable. `done` means
+  Chrome reported completion, not that the file contents or continued existence
+  were verified. Check unverified starts before retrying to avoid duplicates.
 - **A task is traced, not guessed.** Every file keeps its post id, post URL,
   post title, provider and site; the task keeps the posts it scanned and a run
   history (when, how many posts, how many added/queued/saved/failed). "Complete /
@@ -128,8 +138,10 @@ by the suite. Live behaviour is covered by `docs/MANUAL_TESTS.md`.
   *Settings → Enforce rating filter on download* is on.
 - **Validating a draft reuses stored secrets** when the key field is left blank, so
   “edit → validate” does not require re-typing a key.
-- **The queue is stateful across restarts**: `running` items are reset to `pending`
-  when the worker starts; de-duplication applies to pending/running items only.
+- **The queue is stateful across restarts**: running browser IDs are reconciled
+  against Chrome, and the persisted selection can resume dispatch. A running row
+  without an ID is unverified rather than silently restarted. Old start-only done
+  rows and history are also unverified. Active rows cannot be removed or cleared.
 - **e621 User-Agent**: custom UA → `declarativeNetRequest` header rewrite →
   `_client` query parameter fallback (`sendClientParam` setting).
 - **Rate limiting** is per saved server, defaulting to 1 request/second plus the
@@ -143,22 +155,23 @@ by the suite. Live behaviour is covered by `docs/MANUAL_TESTS.md`.
 | Read-only product | No uploads, favourites, pool edits or tag edits. The adapters expose only read endpoints plus the vote/favourite helpers that are not yet surfaced in the UI. |
 | No tag autocomplete | Would need a per-site tag endpoint; `supportsTagSearch` capability is already declared. |
 | Pools/forks browsing | `matchRoute` recognises pool URLs, but no pool listing UI yet. |
-| No integrity check after download | The worker records the filename/size the browser reports; verifying `md5` against the site is future work. |
+| No downloaded-content integrity check | Chrome reports transfer state and byte progress, but the extension does not hash saved files or detect every HTML/error response, and files can later be moved or deleted. |
 | No bulk “download whole search” | Queueing is per page; “queue all loaded” covers the current listing. |
-| Live network tests are not automated | By design (no credentials in CI, no hammering the sites); covered manually. `npm run smoke` exercises the built bundle against the offline mock instead. |
+| Live network tests are not automated | `npm run smoke` uses an offline mock; Pawchive has not been live-tested for the current changes. |
 | Chrome/Edge/Brave only | Built on `chrome.*` MV3 APIs. Firefox would need a `browser.*` shim and manifest tweaks. |
 | No i18n | All strings are English literals in the view layer. |
-| Mirror links are not resolved | The collector stores and downloads the URL a post links to; it does not follow provider redirects to a direct file (Mega/Drive landing pages stay pages). A resolver per provider would be a plugin of its own. |
-| No content hashes in a task package | A `.torrent` verifies pieces; here the bytes sit behind provider pages that the sites never hash. The manifest records what the exporting machine observed (status, filename, bytes) and nothing more - see [docs/TASKS.md](TASKS.md) §4. |
+| Mirror links are not resolved | Known Mega/Drive and other share pages are retained for open/export and refused by the queue. Unknown interstitials can still return HTML; provider resolution and decryption are not implemented. |
+| No content verification in a task package | The manifest records URLs and browser-reported outcomes, not verified bytes or hashes — see [docs/TASKS.md](TASKS.md). |
 | No task-level scheduler | Tasks start when pressed. Per-task concurrency, start times and a queue of tasks are parked until the model earns them. |
 | Preview modules ship inside `dist/` | `dist/preview/*.js` is inert in the extension (the UI only imports it when `chrome.runtime.id` is missing); excluding it from the build would shave a few KB. |
 | No release packaging | `dist/` is loadable unpacked; a zipped CRX/XPI and a CI workflow are not set up yet. |
 
 ## Next steps (suggested order)
 
-1. **Download-integrity pass**: stream `chrome.downloads.onChanged` byte counts
-   into `bsm.queue` so rows show real progress, then compare size/md5 when the site
-   reports a hash and flag mismatches in the row.
+1. **Download-integrity pass**: design byte/hash verification of completed files
+   where Chrome permissions and the site's metadata permit it. Completion tracking
+   is implemented, but `onChanged` does not stream bytes: the panel polls
+   `chrome.downloads.search()` for browser-reported progress.
 2. **Archive picture packing** (ZIP/CBZ/PDF per post, offscreen document) as an
    optional output mode in the panel's settings, mirroring the Rule 34 picture
    modes.

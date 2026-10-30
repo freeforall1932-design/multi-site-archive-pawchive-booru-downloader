@@ -59,6 +59,7 @@ export type UiRequest =
   | { type: 'queue/list' }
   | { type: 'queue/enqueue'; payload: { items: EnqueueInput[] } }
   | { type: 'queue/enqueuePosts'; payload: { serverId: string; posts: EnqueueCandidate[] } }
+  | { type: 'queue/enqueuePawchivePost'; payload: { serverId: string; postId: string } }
   | { type: 'queue/enqueueLinks'; payload: { links: EnqueueLinkInput[]; serverId?: string | null } }
   | { type: 'queue/run'; payload?: { itemIds?: string[] } }
   | { type: 'queue/pause' }
@@ -133,6 +134,7 @@ export interface ResponseMap {
   'queue/list': { summary: QueueSummary; items: QueueItem[]; maxConcurrency: number };
   'queue/enqueue': { added: number; skipped: number; summary: QueueSummary };
   'queue/enqueuePosts': { added: number; skipped: number; summary: QueueSummary };
+  'queue/enqueuePawchivePost': { added: number; skipped: number; unavailable: number; summary: QueueSummary };
   'queue/enqueueLinks': { added: number; skipped: number; invalid: number; summary: QueueSummary };
   'queue/run': { started: boolean; summary: QueueSummary };
   'queue/pause': { summary: QueueSummary };

@@ -8,6 +8,7 @@
 import { registerBuiltinAdapters } from '../adapters/index.js';
 import type { AdapterCatalogEntry, DiagnosticsInfo, EnqueueCandidate, UiRequest } from '../core/messages.js';
 import { getAdapter } from '../core/registry.js';
+import { isUsableServer } from '../core/servers.js';
 import { getPlatform, isExtensionEnvironment } from '../platform/index.js';
 import type {
   BooruPost,
@@ -100,7 +101,7 @@ const state: AppState = {
 };
 
 function emptySummary(): QueueSummary {
-  return { pending: 0, running: 0, done: 0, failed: 0, skipped: 0, canceled: 0, total: 0, paused: false, active: false };
+  return { pending: 0, running: 0, done: 0, failed: 0, skipped: 0, canceled: 0, unverified: 0, total: 0, paused: false, active: false };
 }
 
 // ------------------------------------------------------------------ messaging
@@ -227,7 +228,8 @@ function renderServers(): void {
       const remaining = await sendOrToast<ServerConfigView[]>({ type: 'servers/remove', payload: { id: server.id } }, 'Server deleted');
       if (remaining) {
         state.servers = remaining;
-        state.browse.serverId = remaining.find((entry) => entry.isDefault)?.id ?? remaining[0]?.id ?? null;
+        const supported = remaining.filter(isUsableServer);
+        state.browse.serverId = supported.find((entry) => entry.isDefault)?.id ?? supported[0]?.id ?? null;
         renderNav();
         await render();
       }
@@ -379,7 +381,7 @@ function renderEditor(): void {
 
 function renderBrowseView(): void {
   const browseState: BrowseState = {
-    servers: state.servers,
+    servers: state.servers.filter(isUsableServer),
     adapters: state.adapters,
     serverId: state.browse.serverId,
     tags: state.browse.tags,
@@ -429,18 +431,20 @@ function renderBrowseView(): void {
     },
     onDownloadPost: async (post) => {
       const server = state.servers.find((entry) => entry.id === state.browse.serverId);
-      const result = await send<{ filename: string }>({
+      const result = await send<{ filename: string; post: BooruPost }>({
         type: 'posts/download',
         payload: { serverId: server?.id ?? null, postId: post.id },
       });
-      if (result) toast(`Saving ${result.filename}`, 'success');
+      if (result) {
+        toast(`Started original file download: ${result.filename}`, 'success');
+      }
     },
     onQueueSelected: async () => {
       const server = state.servers.find((entry) => entry.id === state.browse.serverId);
       if (!server) return;
       const candidates: EnqueueCandidate[] = state.browse.posts
         .filter((post) => state.browse.selection.has(post.id))
-        .map((post) => ({ id: post.id, label: `${post.siteType} #${post.id}`, postUrl: post.postUrl, rating: post.rating }));
+        .map((post) => ({ id: post.id, label: `${post.siteType} #${post.id}${post.fileAvailability === 'preview' ? ' [preview only]' : ''}`, postUrl: post.postUrl, rating: post.rating, expectedFileHash: post.siteType === 'pawchive' ? post.md5 : null }));
       const result = await send<{ added: number; skipped: number; summary: QueueSummary }>({
         type: 'queue/enqueuePosts',
         payload: { serverId: server.id, posts: candidates },
@@ -459,9 +463,10 @@ function renderBrowseView(): void {
       if (!server) return;
       const candidates: EnqueueCandidate[] = state.browse.posts.map((post) => ({
         id: post.id,
-        label: `${post.siteType} #${post.id}`,
+        label: `${post.siteType} #${post.id}${post.fileAvailability === 'preview' ? ' [preview only]' : ''}`,
         postUrl: post.postUrl,
         rating: post.rating,
+        expectedFileHash: post.siteType === 'pawchive' ? post.md5 : null,
       }));
       const result = await send<{ added: number; skipped: number; summary: QueueSummary }>({
         type: 'queue/enqueuePosts',
@@ -546,11 +551,12 @@ function renderQueueView(): void {
       await refreshQueue();
     },
     onRetryFailed: async () => {
-      const result = await sendOrToast<{ requeued: number }>({ type: 'queue/retryFailed' }, 'Failed items requeued');
+      if (state.queue.summary.unverified && !globalThis.confirm('Some earlier starts are unverified and may already be on disk. Check Chrome Downloads before retrying. Continue?')) return;
+      const result = await sendOrToast<{ requeued: number }>({ type: 'queue/retryFailed' }, 'Failed or unverified items requeued');
       if (result) await refreshQueue();
     },
     onClear: async (scope) => {
-      if (scope === 'all' && !globalThis.confirm('Remove every queue item?')) return;
+      if (scope === 'all' && !globalThis.confirm('Remove inactive queue rows? Active transfers remain tracked.')) return;
       await send({ type: 'queue/clear', payload: { scope } });
       await refreshQueue();
     },
@@ -724,10 +730,13 @@ async function refreshServers(): Promise<void> {
   const servers = await send<ServerConfigView[]>({ type: 'servers/list' });
   if (servers) {
     state.servers = servers;
-    if (!state.browse.serverId || !servers.some((entry) => entry.id === state.browse.serverId)) {
-      state.browse.serverId = servers.find((entry) => entry.isDefault)?.id ?? servers[0]?.id ?? null;
+    const supported = servers.filter(isUsableServer);
+    if (!state.browse.serverId || !supported.some((entry) => entry.id === state.browse.serverId)) {
+      state.browse.serverId = supported.find((entry) => entry.isDefault)?.id ?? supported[0]?.id ?? null;
     }
-    state.hostAccess = servers.length ? { origin: new URL(servers[0]!.baseUrl).origin, granted: await platform.permissions.contains(new URL(servers[0]!.baseUrl).origin) } : null;
+    let origin: string | null = null;
+    try { origin = supported[0] ? new URL(supported[0].baseUrl).origin : null; } catch { /* Invalid legacy profile. */ }
+    state.hostAccess = origin ? { origin, granted: await platform.permissions.contains(origin) } : null;
   }
   renderNav();
   await render();
@@ -783,11 +792,14 @@ async function boot(): Promise<void> {
   ]);
   state.servers = servers ?? [];
   state.settings = settings;
-  state.browse.serverId = state.servers.find((entry) => entry.isDefault)?.id ?? state.servers[0]?.id ?? null;
+  const supported = state.servers.filter(isUsableServer);
+  state.browse.serverId = supported.find((entry) => entry.isDefault)?.id ?? supported[0]?.id ?? null;
   await refreshDiagnostics();
-  if (state.servers.length) {
-    const origin = new URL(state.servers[0]!.baseUrl).origin;
-    state.hostAccess = { origin, granted: await platform.permissions.contains(origin) };
+  if (supported.length) {
+    try {
+      const origin = new URL(supported[0]!.baseUrl).origin;
+      state.hostAccess = { origin, granted: await platform.permissions.contains(origin) };
+    } catch { /* An invalid saved URL remains available for correction. */ }
   }
   await refreshQueue();
 

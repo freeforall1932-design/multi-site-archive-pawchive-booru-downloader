@@ -15,10 +15,12 @@
  * façade is backed by the offline mock booru, so the identical code path is
  * exercised without any network traffic.
  */
+import { registerBuiltinAdapters } from '../adapters/index.js';
 import type { AdapterCatalogEntry, DiagnosticsInfo, UiRequest } from '../core/messages.js';
 import { fromToRange, parsePageRange } from '../core/pages.js';
 import { composeSearchTags } from '../core/search.js';
 import { getAdapter } from '../core/registry.js';
+import { isUsableServer } from '../core/servers.js';
 import { getPlatform, isExtensionEnvironment } from '../platform/index.js';
 import type {
   BooruPost,
@@ -36,6 +38,7 @@ import type {
   TaskView,
   ValidationResult,
 } from '../shared/types.js';
+import { safeUrl } from '../shared/util.js';
 import { h } from '../ui/dom.js';
 import { renderDiagnostics, copyDiagnostics } from '../ui/diagnostics-view.js';
 import {
@@ -87,7 +90,7 @@ const TABS: Array<{ id: PanelTab; label: string }> = [
 ];
 
 /** Profiles whose API answers with the post bodies mirror links live in. */
-const ARCHIVE_SITE_TYPES = new Set(['kemono', 'coomer', 'pawchive']);
+const ARCHIVE_SITE_TYPES = new Set(['pawchive']);
 
 interface ListingRuntime {
   serverId: string | null;
@@ -165,7 +168,7 @@ interface PanelState {
 }
 
 function emptySummary(): QueueSummary {
-  return { pending: 0, running: 0, done: 0, failed: 0, skipped: 0, canceled: 0, total: 0, paused: false, active: false };
+  return { pending: 0, running: 0, done: 0, failed: 0, skipped: 0, canceled: 0, unverified: 0, total: 0, paused: false, active: false };
 }
 
 const state: PanelState = {
@@ -184,7 +187,7 @@ const state: PanelState = {
     toPage: '',
     rangeText: '1',
     media: 'all',
-    skipDownloaded: true,
+    skipDownloaded: false,
     ratingOverride: null,
     suggestions: [],
     lastResult: null,
@@ -199,7 +202,7 @@ const state: PanelState = {
     serverId: null,
     query: '',
     links: [],
-    stats: { total: 0, new: 0, queued: 0, done: 0, failed: 0 },
+    stats: { total: 0, new: 0, queued: 0, done: 0, failed: 0, unverified: 0 },
     tasks: [],
     expanded: new Set(),
     activeTaskId: null,
@@ -239,6 +242,7 @@ async function send<T>(request: UiRequest): Promise<T | null> {
 // ----------------------------------------------------------------------- boot
 
 async function boot(): Promise<void> {
+  registerBuiltinAdapters();
   if (!isExtensionEnvironment()) {
     // The preview harness serves this page in a normal tab, so the mock service
     // graph has to be installed before the first request goes out.
@@ -247,16 +251,15 @@ async function boot(): Promise<void> {
     els.previewBanner.hidden = false;
   }
 
-  await Promise.all([refreshSettings(), refreshServers(), refreshQueue(), refreshHistory(), refreshLinks()]);
+  await Promise.all([refreshSettings(), refreshServers(), refreshQueue(), refreshHistory(), refreshLinks(), refreshDiagnostics()]);
   state.links.serverId =
-    state.servers.find((entry) => ARCHIVE_SITE_TYPES.has(entry.siteType))?.id ?? state.servers[0]?.id ?? null;
+    state.servers.find((entry) => ARCHIVE_SITE_TYPES.has(entry.siteType) && isUsableServer(entry))?.id ?? null;
   state.listing.media = state.settings?.mediaFilter ?? 'all';
-  state.listing.skipDownloaded = state.settings?.skipDownloaded ?? true;
+  state.listing.skipDownloaded = state.settings?.skipDownloaded ?? false;
   state.tab = hashTab() ?? state.settings?.panelDefaultTab ?? 'browse';
   applyTheme(state.settings?.theme ?? 'system');
   render();
   void refreshContext();
-  void refreshDiagnostics();
   startPolling();
 }
 
@@ -276,12 +279,15 @@ async function refreshServers(): Promise<void> {
   const servers = await send<ServerConfigView[]>({ type: 'servers/list' });
   if (!servers) return;
   state.servers = servers;
-  if (!state.listing.serverId || !servers.some((entry) => entry.id === state.listing.serverId)) {
-    state.listing.serverId = servers.find((entry) => entry.isDefault)?.id ?? servers[0]?.id ?? null;
+  const supported = servers.filter(isUsableServer);
+  if (!state.listing.serverId || !supported.some((entry) => entry.id === state.listing.serverId)) {
+    state.listing.serverId = supported.find((entry) => entry.isDefault)?.id ?? supported[0]?.id ?? null;
   }
-  state.hostAccess = servers.length
-    ? { origin: new URL(servers[0]!.baseUrl).origin, granted: await platform.permissions.contains(new URL(servers[0]!.baseUrl).origin) }
-    : null;
+  const origin = supported[0] ? safeUrl(supported[0].baseUrl)?.origin ?? null : null;
+  state.hostAccess = origin ? { origin, granted: await platform.permissions.contains(origin) } : null;
+  if (!state.links.serverId || !servers.some((entry) => entry.id === state.links.serverId && ARCHIVE_SITE_TYPES.has(entry.siteType) && isUsableServer(entry))) {
+    state.links.serverId = servers.find((entry) => ARCHIVE_SITE_TYPES.has(entry.siteType) && isUsableServer(entry))?.id ?? null;
+  }
   await refreshSuggestions();
 }
 
@@ -289,6 +295,8 @@ async function refreshQueue(): Promise<void> {
   const result = await send<{ summary: QueueSummary; items: QueueItem[]; maxConcurrency: number }>({ type: 'queue/list' });
   if (!result) return;
   state.queue = { summary: result.summary, items: result.items, maxConcurrency: result.maxConcurrency, busy: state.queue.busy };
+  const post = state.post.post;
+  if (post) state.post = { ...state.post, queued: queueHasPost(post.serverId, post.id) };
   reconcileSelection();
 }
 
@@ -315,7 +323,13 @@ async function refreshHistory(): Promise<void> {
   const result = await send<{ entries: DownloadHistoryEntry[]; total: number }>({ type: 'history/list' });
   if (!result) return;
   state.historyCount = result.total;
-  state.history = new Map(result.entries.map((entry) => [entry.key, entry]));
+  // Legacy entries may be samples or start-only records. Neither can hide an original.
+  state.history = new Map(result.entries.filter((entry) => entry.quality === 'original' && entry.completion === 'browser-complete').map((entry) => [entry.key, entry]));
+  const post = state.post.post;
+  if (post) {
+    const entry = state.history.get(`${post.serverId}:${post.id}`);
+    state.post = { ...state.post, saved: entry ? { filename: entry.filename, at: entry.at } : null };
+  }
 }
 
 async function refreshSuggestions(): Promise<void> {
@@ -493,7 +507,7 @@ function pillTone(): string {
   if (state.queue.summary.running || state.queue.summary.active) return 'running';
   if (state.listing.busy === 'crawl') return 'crawling';
   if (state.listing.busy === 'search') return 'crawling';
-  if (state.queue.summary.failed) return 'warn';
+  if (state.queue.summary.failed || state.queue.summary.unverified) return 'warn';
   if (!state.settings) return 'idle';
   return 'idle';
 }
@@ -504,6 +518,7 @@ function statusPillText(): string {
   if (state.listing.busy === 'crawl') return 'fetching';
   if (state.listing.busy === 'search') return 'listing';
   if (state.queue.summary.failed) return `${state.queue.summary.failed} failed`;
+  if (state.queue.summary.unverified) return `${state.queue.summary.unverified} unverified`;
   if (state.queue.summary.pending) return `${state.queue.summary.pending} queued`;
   return 'Ready';
 }
@@ -530,6 +545,7 @@ function renderContext(): void {
     renderPostCard(postHost, state.post, {
       onDownload: () => void downloadPost(),
       onAddToList: () => void addPostToList(),
+      onAddAllPawchiveFiles: state.context.server?.siteType === 'pawchive' ? () => void addAllPawchiveFiles() : undefined,
       onReload: () => {
         const route = state.context.route;
         if (route?.postId && state.context.server) void loadPost(state.context.server.id, route.postId);
@@ -638,7 +654,7 @@ function reconcileLinksSelection(): void {
   const next = new Set<string>();
   for (const id of state.links.selection) if (available.has(id)) next.add(id);
   for (const link of state.links.links) {
-    if (link.status === 'done' || link.status === 'failed') continue;
+    if (link.status === 'done' || link.status === 'failed' || link.status === 'unverified') continue;
     if (!state.links.snapshot.has(link.id)) next.add(link.id);
   }
   state.links.selection = next;
@@ -685,10 +701,10 @@ function buildLinksState(): LinksState {
   budget -= unfiled.length;
 
   return {
-    servers: state.servers,
+    servers: state.servers.filter((entry) => ARCHIVE_SITE_TYPES.has(entry.siteType) && isUsableServer(entry)),
     serverId: state.links.serverId,
     query: state.links.query,
-    canCollect: !!server && ARCHIVE_SITE_TYPES.has(server.siteType),
+    canCollect: !!server && ARCHIVE_SITE_TYPES.has(server.siteType) && isUsableServer(server),
     busy: state.links.busy,
     progress: state.links.progress,
     error: state.links.error,
@@ -877,6 +893,8 @@ async function collectLinks(): Promise<void> {
 
 async function queueLinks(ids: string[]): Promise<void> {
   if (!ids.length) return;
+  const unverified = state.links.links.filter((link) => ids.includes(link.id) && link.status === 'unverified').length;
+  if (unverified && !globalThis.confirm(`${unverified} link(s) have unverified prior starts. They may already be on disk. Check Chrome Downloads before retrying. Queue them anyway?`)) return;
   const result = await send<{ queued: number; skipped: number; invalid: number }>({
     type: 'links/queue',
     payload: { ids },
@@ -961,6 +979,9 @@ async function clearLinks(scope: 'all' | 'done' | 'pending'): Promise<void> {
 
 /** Queue everything a task is missing (new files and retries) and start it. */
 async function runTask(taskId: string, mode: 'missing' | 'all'): Promise<void> {
+  const members = new Set(state.links.tasks.find((entry) => entry.task.id === taskId)?.task.memberIds ?? []);
+  const unverified = state.links.links.filter((link) => members.has(link.id) && link.status === 'unverified').length;
+  if (unverified && !globalThis.confirm(`${unverified} task file(s) have unverified prior starts. They may already be on disk. Check Chrome Downloads before retrying. Continue?`)) return;
   state.links.busyTaskId = taskId;
   renderLinksTab();
   const result = await send<{
@@ -977,7 +998,7 @@ async function runTask(taskId: string, mode: 'missing' | 'all'): Promise<void> {
   await Promise.all([refreshLinks(), refreshQueue()]);
   const parts = [`${result.queued} file(s) queued`];
   if (result.plan.retrying) parts.push(`${result.plan.retrying} retry`);
-  if (result.plan.alreadyDone) parts.push(`${result.plan.alreadyDone} already saved, skipped`);
+  if (result.plan.alreadyDone) parts.push(`${result.plan.alreadyDone} previously completed, skipped`);
   if (result.skipped) parts.push(`${result.skipped} already in the queue`);
   state.dockNotice = {
     text: `${parts.join(' · ')}.${result.started ? ' Downloading slowly in the background.' : ''}`,
@@ -992,7 +1013,7 @@ async function pauseTask(taskId: string): Promise<void> {
   const result = await send<{ task: TaskView | null }>({ type: 'tasks/pause', payload: { taskId } });
   if (!result) return;
   await Promise.all([refreshLinks(), refreshQueue()]);
-  state.dockNotice = { text: 'Task paused. Files already saved stay saved; Download missing resumes the rest.', tone: 'plain' };
+  state.dockNotice = { text: 'Task paused. Waiting starts were removed; already started transfers continue in Chrome.', tone: 'plain' };
   render();
 }
 
@@ -1117,11 +1138,11 @@ function buildListingState(): ListingState {
   const parsed = currentRange();
   const composed = composeSearchTags({
     tags: state.listing.tags,
-    blacklist: state.settings?.tagBlacklist ?? '',
-    globalSuffix: state.settings?.globalTagSuffix ?? '',
+    blacklist: server?.siteType === 'pawchive' ? '' : state.settings?.tagBlacklist ?? '',
+    globalSuffix: server?.siteType === 'pawchive' ? '' : state.settings?.globalTagSuffix ?? '',
   });
   return {
-    servers: state.servers,
+    servers: state.servers.filter(isUsableServer),
     adapters: state.adapters,
     serverId: state.listing.serverId,
     tags: state.listing.tags,
@@ -1245,17 +1266,16 @@ function renderDockBar(): void {
   const selected = [...state.selection].filter((id) => state.queue.items.some((item) => item.id === id && item.status === 'pending'));
   const dockState: DockState = {
     concurrency: state.settings?.maxConcurrency ?? 2,
-    filePreference: state.settings?.filePreference ?? 'original',
     selectedCount: selected.length,
     pendingCount: state.queue.summary.pending,
     running: state.queue.summary.running > 0 || state.queue.summary.active,
+    dispatching: state.queue.summary.active,
     paused: state.queue.summary.paused,
     notice: state.dockNotice,
     busy: state.queue.busy,
   };
   renderDock(els.dockHost, dockState, {
     onConcurrencyChange: (value) => void patchSettings({ maxConcurrency: value }),
-    onFilePreferenceChange: (value) => void patchSettings({ filePreference: value }),
     onDownloadSelected: () => void downloadSelected(),
     onStart: () => void startQueue(),
     onPause: () => void pauseQueue(true),
@@ -1315,7 +1335,9 @@ async function runFetch(options: { mode: 'page' | 'range'; download?: boolean })
     done += 1;
     state.listing.progress = { done, total: totalPages, label: `Listed page ${page} · ${collected.length} post(s) so far` };
     renderBrowse();
-    return result.posts.length > 0;
+    // A Pawchive page can have only text/deferred posts but later pages may
+    // still have downloadable files.
+    return result.posts.length > 0 || result.hasMore;
   };
 
   try {
@@ -1345,7 +1367,7 @@ async function runFetch(options: { mode: 'page' | 'range'; download?: boolean })
         type: 'queue/enqueuePosts',
         payload: {
           serverId: server.id,
-          posts: collected.map((post) => ({ id: post.id, label: postLabel(post), postUrl: post.postUrl, rating: post.rating })),
+          posts: collected.map((post) => ({ id: post.id, label: postLabel(post), postUrl: post.postUrl, rating: post.rating, expectedFileHash: post.siteType === 'pawchive' ? post.md5 : null })),
         },
       });
       for (const post of collected) state.thumbnails.set(post.id, post.previewUrl);
@@ -1353,7 +1375,7 @@ async function runFetch(options: { mode: 'page' | 'range'; download?: boolean })
         await refreshQueue();
         const bits = [`${queued.added} row(s) added`];
         if (queued.skipped) bits.push(`${queued.skipped} skipped (duplicate or rating filter)`);
-        if (skippedDownloaded) bits.push(`${skippedDownloaded} already downloaded`);
+        if (skippedDownloaded) bits.push(`${skippedDownloaded} previously completed`);
         state.dockNotice = { text: `${bits.join(' · ')}. Review the list, then press Download selected.`, tone: 'ok' };
       }
     } else {
@@ -1417,7 +1439,8 @@ function collectPosts(collected: BooruPost[], result: SearchResult): { added: nu
 }
 
 function postLabel(post: BooruPost): string {
-  return post.tags[0] ? `#${post.id} ${post.tags[0]}` : `${post.siteType} #${post.id}`;
+  const label = post.tags[0] ? `#${post.id} ${post.tags[0]}` : `${post.siteType} #${post.id}`;
+  return post.fileAvailability === 'preview' ? `${label} [preview only]` : label;
 }
 
 // -------------------------------------------------------------- queue actions
@@ -1461,7 +1484,7 @@ async function stopQueue(): Promise<void> {
   for (const item of state.queue.items.filter((entry) => entry.status === 'pending' || entry.status === 'running')) {
     await send({ type: 'queue/cancel', payload: { itemId: item.id } });
   }
-  state.dockNotice = { text: 'Stopped. Canceled rows stay in the list so you can retry them.', tone: 'plain' };
+  state.dockNotice = { text: 'Stop requested. Chrome may take a moment to confirm cancellation; canceled rows remain in the list.', tone: 'plain' };
   await refreshQueue();
   render();
 }
@@ -1474,23 +1497,24 @@ async function cancelItem(itemId: string): Promise<void> {
 
 async function removeItems(itemIds: string[]): Promise<void> {
   if (!itemIds.length) return;
-  await send({ type: 'queue/remove', payload: { itemIds } });
+  const result = await send<{ removed: number }>({ type: 'queue/remove', payload: { itemIds } });
   for (const id of itemIds) state.selection.delete(id);
   await refreshQueue();
-  state.dockNotice = { text: `${itemIds.length} row(s) removed from the list. Files on disk were not touched.`, tone: 'plain' };
+  state.dockNotice = { text: `${result?.removed ?? 0} row(s) removed. Active transfers remain tracked; files on disk were not touched.`, tone: 'plain' };
   render();
 }
 
 async function retryFailed(): Promise<void> {
+  if (state.queue.summary.unverified && !globalThis.confirm(`${state.queue.summary.unverified} row(s) have unverified prior starts. They may already be on disk. Check Chrome Downloads before retrying. Continue?`)) return;
   const result = await send<{ requeued: number; summary: QueueSummary }>({ type: 'queue/retryFailed' });
   await refreshQueue();
   if (result) toast(`${result.requeued} row(s) queued again`, 'success');
-  state.dockNotice = { text: `${result?.requeued ?? 0} failed row(s) are queued again.`, tone: 'plain' };
+  state.dockNotice = { text: `${result?.requeued ?? 0} failed or unverified row(s) are queued again.`, tone: 'plain' };
   render();
 }
 
 async function clearQueue(scope: 'completed' | 'failed' | 'all'): Promise<void> {
-  if (scope === 'all' && state.queue.items.length && !globalThis.confirm('Clear the whole list? Files already downloaded stay on disk.')) return;
+  if (scope === 'all' && state.queue.items.length && !globalThis.confirm('Clear inactive rows? Active transfers remain tracked, and files on disk are not touched.')) return;
   await send({ type: 'queue/clear', payload: { scope } });
   await refreshQueue();
   render();
@@ -1517,18 +1541,15 @@ async function downloadPost(): Promise<void> {
   if (!route?.postId || !server) return;
   state.post = { ...state.post, busy: true };
   renderContext();
-  const result = await send<{ filename: string; viaFallback: boolean }>({
+  const result = await send<{ filename: string; viaFallback: boolean; post: BooruPost }>({
     type: 'posts/download',
-    payload: { serverId: server.id, postId: route.postId },
+    payload: { serverId: server.id, postId: state.post.post?.id ?? route.postId },
   });
   state.post = { ...state.post, busy: false };
   if (result) {
-    toast(`Saved ${result.filename}`, 'success');
-    await refreshHistory();
-    state.post = {
-      ...state.post,
-      saved: { filename: result.filename, at: new Date().toISOString() },
-    };
+    toast(`Started original file download: ${result.filename}. Track it in the queue.`, 'success');
+    state.post = { ...state.post, post: result.post };
+    await Promise.all([refreshQueue(), refreshHistory()]);
   }
   render();
 }
@@ -1544,9 +1565,10 @@ async function addPostToList(): Promise<void> {
       items: [
         {
           serverId: server.id,
-          postId: route.postId,
+          postId: post?.id ?? route.postId,
           label: post ? postLabel(post) : `#${route.postId}`,
           postUrl: post?.postUrl ?? route.canonicalUrl,
+          expectedFileHash: post?.siteType === 'pawchive' ? post.md5 : null,
         },
       ],
     },
@@ -1558,6 +1580,27 @@ async function addPostToList(): Promise<void> {
     text: result?.added ? `${post ? postLabel(post) : `#${route.postId}`} added to the list.` : 'That post is already in the list.',
     tone: result?.added ? 'ok' : 'plain',
   };
+  render();
+}
+
+async function addAllPawchiveFiles(): Promise<void> {
+  const route = state.context.route;
+  const server = state.context.server;
+  if (!route?.postId || !server || server.siteType !== 'pawchive') return;
+  state.post = { ...state.post, busy: true };
+  renderContext();
+  const result = await send<{ added: number; skipped: number; unavailable: number }>({
+    type: 'queue/enqueuePawchivePost',
+    payload: { serverId: server.id, postId: route.postId },
+  });
+  state.post = { ...state.post, busy: false };
+  await refreshQueue();
+  if (result) {
+    const parts = [`${result.added} original file(s) added`];
+    if (result.skipped) parts.push(`${result.skipped} already queued or filtered`);
+    if (result.unavailable) parts.push(`${result.unavailable} unavailable or preview-only`);
+    state.dockNotice = { text: `${parts.join(' · ')}. Press Download selected to start.`, tone: result.unavailable ? 'plain' : 'ok' };
+  }
   render();
 }
 
@@ -1663,9 +1706,7 @@ async function deleteServer(server: ServerConfigView): Promise<void> {
   const remaining = await send<ServerConfigView[]>({ type: 'servers/remove', payload: { id: server.id } });
   if (remaining) {
     state.servers = remaining;
-    if (!remaining.some((entry) => entry.id === state.listing.serverId)) {
-      state.listing.serverId = remaining.find((entry) => entry.isDefault)?.id ?? remaining[0]?.id ?? null;
-    }
+    await refreshServers();
     await refreshDiagnostics();
     render();
   }

@@ -86,10 +86,9 @@ function normalizePost(raw: unknown, ctx: AdapterContext): BooruPost {
   const post = asRecord(raw);
   if (!post) throw shapeError('Danbooru post', 'post entry was not an object');
   const id = pickString(post, 'id') ?? '';
-  const fileUrl = absolutize(
-    ctx.baseUrl,
-    pickString(post, 'file_url', 'large_file_url') ?? pickString(post, 'sample_url') ?? pickString(post, 'preview_file_url'),
-  ) ?? '';
+  // `large_file_url`, sample and preview are not the original. Keep them for
+  // display only when the API withholds `file_url` (e.g. a restricted post).
+  const fileUrl = absolutize(ctx.baseUrl, pickString(post, 'file_url')) ?? '';
   const ext = deriveExt(post, fileUrl);
   const previewUrl =
     absolutize(ctx.baseUrl, pickString(post, 'preview_file_url', 'preview_url', 'large_file_url', 'file_url')) ?? fileUrl;

@@ -35,8 +35,15 @@ function isHistoryEntry(value: unknown): value is DownloadHistoryEntry {
  */
 export class DownloadHistoryStore {
   private cache: DownloadHistoryEntry[] | null = null;
+  private chain: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly area: StorageArea) {}
+
+  private serialize<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.chain.then(task, task);
+    this.chain = next.then(() => undefined, () => undefined);
+    return next;
+  }
 
   async list(): Promise<DownloadHistoryEntry[]> {
     if (!this.cache) {
@@ -53,39 +60,47 @@ export class DownloadHistoryStore {
 
   async has(serverId: string, postId: string): Promise<boolean> {
     const key = historyKey(serverId, postId);
-    return (await this.list()).some((entry) => entry.key === key);
+    return (await this.list()).some((entry) => entry.key === key && entry.quality === 'original' && entry.completion === 'browser-complete');
   }
 
-  /** Map of `serverId:postId` → entry, the shape listings filter against. */
+  /** Legacy start-only or unknown-quality entries must never hide an original. */
   async index(): Promise<Map<string, DownloadHistoryEntry>> {
     const map = new Map<string, DownloadHistoryEntry>();
-    for (const entry of await this.list()) map.set(entry.key, entry);
+    for (const entry of await this.list()) {
+      if (entry.quality === 'original' && entry.completion === 'browser-complete' && !map.has(entry.key)) map.set(entry.key, entry);
+    }
     return map;
   }
 
-  /** Record a download; re-downloading the same post refreshes its entry. */
+  /** Record a download; serialized mutations prevent simultaneous completions losing entries. */
   async add(entry: DownloadHistoryEntry): Promise<void> {
-    const entries = await this.list();
-    const next = entries.filter((existing) => existing.key !== entry.key);
-    next.unshift({ ...entry });
-    this.cache = next.slice(0, MAX_HISTORY_ENTRIES);
-    await this.area.set(STORAGE_KEYS.history, this.cache);
+    return this.serialize(async () => {
+      const entries = await this.list();
+      const next = entries.filter((existing) => existing.key !== entry.key);
+      next.unshift({ ...entry });
+      this.cache = next.slice(0, MAX_HISTORY_ENTRIES);
+      await this.area.set(STORAGE_KEYS.history, this.cache);
+    });
   }
 
   async remove(serverId: string, postId: string): Promise<number> {
-    const key = historyKey(serverId, postId);
-    const entries = await this.list();
-    this.cache = entries.filter((entry) => entry.key !== key);
-    await this.area.set(STORAGE_KEYS.history, this.cache);
-    return entries.length - this.cache.length;
+    return this.serialize(async () => {
+      const key = historyKey(serverId, postId);
+      const entries = await this.list();
+      this.cache = entries.filter((entry) => entry.key !== key);
+      await this.area.set(STORAGE_KEYS.history, this.cache);
+      return entries.length - this.cache.length;
+    });
   }
 
   /** "Reset history" in the panel: everything is listed again afterwards. */
   async clear(): Promise<number> {
-    const entries = await this.list();
-    this.cache = [];
-    await this.area.set(STORAGE_KEYS.history, this.cache);
-    return entries.length;
+    return this.serialize(async () => {
+      const entries = await this.list();
+      this.cache = [];
+      await this.area.set(STORAGE_KEYS.history, this.cache);
+      return entries.length;
+    });
   }
 
   /** Another context wrote the history (options page / worker). */

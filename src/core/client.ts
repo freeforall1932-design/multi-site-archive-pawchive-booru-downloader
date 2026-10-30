@@ -10,12 +10,13 @@ import type {
   ServerConfig,
 } from '../shared/types.js';
 import { DEFAULT_SAFE_RATINGS } from '../shared/types.js';
-import { clamp, unique } from '../shared/util.js';
+import { clamp, safeUrl, unique } from '../shared/util.js';
 import type { BooruAdapter } from './adapter.js';
 import { createAdapterContext, detectRoute, getAdapter, listAdapters, requireAdapter } from './registry.js';
-import type { ServerStore } from './servers.js';
+import { isUsableServer, type ServerStore } from './servers.js';
 import type { SettingsStore } from './settings.js';
 import type { ValidationService } from './validation.js';
+import { requestRateKey } from './request-policy.js';
 
 export interface BooruClientDeps {
   servers: ServerStore;
@@ -94,7 +95,7 @@ export class BooruClient {
     };
     const request = adapter.buildSearchRequest(ctx, fullSpec);
     const snapshot = await this.deps.http.request(request, {
-      rateKey: `server:${server.id}`,
+      rateKey: requestRateKey(server),
       minIntervalMs: Math.max(settings.minRequestIntervalMs, adapter.capabilities.minRequestIntervalMs),
     });
     return adapter.parseSearchResponse(snapshot, fullSpec, ctx);
@@ -106,7 +107,7 @@ export class BooruClient {
     const ctx = createAdapterContext(adapter, server, settings);
     const request = adapter.buildPostRequest(ctx, postId);
     const snapshot = await this.deps.http.request(request, {
-      rateKey: `server:${server.id}`,
+      rateKey: requestRateKey(server),
       minIntervalMs: Math.max(settings.minRequestIntervalMs, adapter.capabilities.minRequestIntervalMs),
     });
     return adapter.parsePostResponse(snapshot, postId, ctx);
@@ -127,7 +128,7 @@ export class BooruClient {
     const ctx = createAdapterContext(adapter, server, settings);
     const request = adapter.buildPostRequest(ctx, postId);
     const snapshot = await this.deps.http.request(request, {
-      rateKey: `server:${server.id}`,
+      rateKey: requestRateKey(server),
       minIntervalMs: Math.max(settings.minRequestIntervalMs, adapter.capabilities.minRequestIntervalMs),
     });
     const failure = adapter.classifyFailure?.(snapshot) ?? null;
@@ -156,8 +157,17 @@ export class BooruClient {
     const servers = await this.deps.servers.list();
     const match = detectRoute(url, servers);
     if (!match) return null;
-    const server = match.serverId ? servers.find((entry) => entry.id === match.serverId) ?? null : null;
-    return { ...match, server };
+    let server = match.serverId ? servers.find((entry) => entry.id === match.serverId) ?? null : null;
+    if (!server && match.siteType === 'pawchive') {
+      // `www` and the former domain are aliases of the same creator archive.
+      const host = safeUrl(url)?.hostname.replace(/^www\./, '');
+      const candidates = servers.filter((entry) => entry.siteType === 'pawchive' && isUsableServer(entry));
+      server = candidates.find((entry) => safeUrl(entry.baseUrl)?.hostname === host)
+        ?? candidates.find((entry) => entry.isDefault)
+        ?? candidates[0]
+        ?? null;
+    }
+    return { ...match, ...(server ? { serverId: server.id } : {}), server };
   }
 
   /** Resolve a post referenced by URL (used by the content script + popup). */

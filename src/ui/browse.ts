@@ -185,7 +185,7 @@ function postCard(post: BooruPost, state: BrowseState, callbacks: BrowseCallback
     ),
     h('img', {
       class: 'post-thumb',
-      src: post.previewUrl,
+      src: post.previewUrl || undefined,
       alt: `${post.siteType} post ${post.id}`,
       loading: 'lazy',
       on: { error: (event) => ((event.target as HTMLImageElement).classList.add('is-broken')) },
@@ -193,7 +193,8 @@ function postCard(post: BooruPost, state: BrowseState, callbacks: BrowseCallback
     h(
       'div',
       { class: 'post-info' },
-      h('div', { class: 'post-title' }, h('strong', { text: `#${post.id}` }), ratingChip(post.rating)),
+      h('div', { class: 'post-title' }, h('strong', { text: `#${post.id}` }), ratingChip(post.rating),
+        post.fileAvailability === 'preview' ? h('span', { class: 'chip chip-soft', text: 'preview only' }) : null),
       h('div', { class: 'muted small', text: `${post.ext ?? '?'} · ${post.width ?? '?'}×${post.height ?? '?'}${post.score !== null ? ` · score ${post.score}` : ''}` }),
       h('div', { class: 'muted small truncate', text: post.tags.slice(0, 6).join(' ') || '(no tags reported)' }),
       siteTypeChip(post.siteType),

@@ -11,7 +11,7 @@
  */
 import { registerBuiltinAdapters } from '../adapters/index.js';
 import { BooruClient } from '../core/client.js';
-import { ChromeDownloader } from '../core/downloads.js';
+import { ChromeDownloader, PawchivePacedDownloader } from '../core/downloads.js';
 import type { UiRequest } from '../core/messages.js';
 import { DownloadHistoryStore, SearchHistoryStore } from '../core/history.js';
 import { MirrorLinkStore } from '../core/link-store.js';
@@ -36,12 +36,23 @@ const servers = new ServerStore(area);
 const http = new HttpClient({ maxRetries: 3 });
 const validation = new ValidationService(http);
 const client = new BooruClient({ servers, settings, http, validation });
-const downloader = new ChromeDownloader();
+const downloader = new PawchivePacedDownloader(new ChromeDownloader());
 const history = new DownloadHistoryStore(area);
 const searches = new SearchHistoryStore(area);
 const links = new MirrorLinkStore(area);
 const tasks = new TaskStore(area);
 const queue = new DownloadQueue({ storage: area, client, servers, settings, downloader, history, links, tasks });
+
+// MV3 listeners must be registered synchronously on every worker startup. The
+// ID is persisted by the queue; a search after registration closes the race in
+// which Chrome finishes before the start callback returns or storage is written.
+globalThis.chrome?.downloads?.onChanged?.addListener((delta) => {
+  void queue.handleDownloadChanged(delta.id).catch(() => console.warn('[booru] download reconciliation failed; it will be retried.'));
+});
+globalThis.chrome?.downloads?.onErased?.addListener((id) => {
+  void queue.handleDownloadChanged(id).catch(() => console.warn('[booru] erased download reconciliation failed; it will be retried.'));
+});
+void queue.recover().catch(() => console.warn('[booru] queue recovery failed; open the queue to retry.'));
 
 const handle = createRouter({
   client,

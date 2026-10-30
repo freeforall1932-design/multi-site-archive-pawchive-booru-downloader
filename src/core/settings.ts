@@ -34,7 +34,9 @@ export function normalizeSettings(raw: unknown): ExtensionSettings {
     showThumbnails: input.showThumbnails ?? DEFAULT_SETTINGS.showThumbnails,
     autoStartQueue: input.autoStartQueue ?? DEFAULT_SETTINGS.autoStartQueue,
     duplicateBehaviour: input.duplicateBehaviour === 'overwrite' ? 'overwrite' : 'uniquify',
-    filePreference: input.filePreference === 'sample' ? 'sample' : 'original',
+    // Legacy profiles may contain `sample`; silently migrate them to the only
+    // supported download quality. UI thumbnails are unaffected.
+    filePreference: 'original',
     tagBlacklist: sanitizeTagList(input.tagBlacklist, 500),
     searchHistoryEnabled: input.searchHistoryEnabled ?? DEFAULT_SETTINGS.searchHistoryEnabled,
     searchHistoryLimit: clamp(toInt(input.searchHistoryLimit, DEFAULT_SETTINGS.searchHistoryLimit), 0, 50),

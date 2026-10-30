@@ -10,7 +10,7 @@ one dock, one list, one settings screen — while staying a *booru* tool:
 | Where the idea comes from | What was taken | How it was adapted here |
 | --- | --- | --- |
 | **twitter-batch-download** (`X Media Downloader`) | Header with an eyebrow + live status pill, a "what page am I on?" card with a refresh button, a summary strip, toolbars, a row list with per-row remove, a fixed download dock with a segmented concurrency control, output settings in a collapsible `<details>` | The "active tab" card resolves the page against your **saved booru servers** instead of one hard-coded site; rows are booru posts (rating, tags, md5, video/picture) |
-| **rule34video** (`Downloader for Rule 34`) | Listing card with `List this page` / `Download page`, `From … To` page range plus an **advanced** box (`2,4,6-10`, `1-99`, `50-`, `all`), a media filter, "skip downloaded", a page-limit cap on one crawl, progress bar, review-then-download promise, dock with concurrency **and quality** selects | Pages are the sites' own listing pages (e621/Danbooru/Gelbooru paginate differently, the adapters handle that); the media filter is picture/video; quality is *original vs sample* file rendition |
+| **rule34video** (`Downloader for Rule 34`) | Listing card with `List this page` / `Download page`, `From … To` page range plus an **advanced** box (`2,4,6-10`, `1-99`, `50-`, `all`), a media filter, "skip downloaded", a page-limit cap on one crawl, progress bar, review-then-download promise, dock with concurrency **and quality** selects | Pages are the sites' own listing pages (e621/Danbooru/Gelbooru paginate differently, the adapters handle that); the media filter is picture/video; downloads are original-only; samples are used only for display |
 | **nh-dw-2.0** (`NHentai Downloader`) | Settings as **sections with a heading and a plain-language hint per option**, a name-template editor made of checkboxes with a custom-template fallback and a live preview, download history with "skip downloaded", per-server credentials stored in `storage.local` only, `uiMode` (panel vs popup) | Sections cover booru concerns: rating filters, per-server credentials, request spacing, tag blacklist, template tokens that exist here (`{md5}`, `{rating}`, `{artist}` …) |
 | **Anime Boxes** (Gelbooru/Danbooru client) | Multi-server profile list, tag search with remembered searches, tag blacklist, picture/video split, "you already have this" awareness | Search history + blacklist live in Settings and feed the panel search box; `skipDownloaded` greys out/omits posts found in the download history |
 
@@ -25,25 +25,25 @@ one dock, one list, one settings screen — while staying a *booru* tool:
 ├───────────────────────────────────────────────────────────┤  #browse #queue #links
 │ ●  e621 post #1500000 — default profile             [Use…]│  #servers #settings)
 │ [thumb] #1500000 safe  [video]                            │  "this post" card
-│         [Download this post] [Add to list]                │
+│         [Download this file] [Add to list]                │
 ├───────────────────────────────────────────────────────────┤
 │ [ e621 (demo account) ▾ ]                                 │
 │ [ tags, e.g. cat solo rating:safe              ] [×]      │  search + suggestions
 │ This fetch: +1 always-on tag(s) · −2 blacklisted          │
 │ [ List this page ] [ Download page ]                      │
 │ From [1]  To [last]                              advanced │  page range
-│ [ Pics + videos ▾ ]  ☑ Skip downloaded                    │
+│ [ Pics + videos ▾ ]  ☐ Skip completed                       │
 │ ☑ apply this profile's rating filter (safe)               │
 │ [ Fetch selected pages ]                          [ Stop ]│
 │  ▓▓▓▓▓▓░░░░  Listed page 3 · 120 post(s) so far           │
 ├───────────────────────────────────────────────────────────┤
 │   18 listed        3 selected        2 completed          │  summary
 │ ☑ Select all   Invert   Remove selected (3)               │  toolbars
-│ Retry failed   Clear finished   Reset history   Clear list│
-│ [☑][thumb] #1500000 [pic][safe][e621][saved]  completed ✕ │  rows (a row *is* a
+│ Retry failed / unverified   Clear finished   Reset history   Clear list│
+│ [☑][thumb] #1500000 [pic][safe][e621][completed] completed  ✕ │  rows (a row *is* a
 │ [☑][thumb] #1500001 [video][general][e621]  downloading ✕ │  persisted queue item)
 ├───────────────────────────────────────────────────────────┤
-│ Downloads at once [1][2][3][5]        Quality [Original ▾]│  dock (fixed)
+│ Start workers [1][2][3][5]            Original files only│  dock (fixed)
 │ [ Download selected (3) ]                        [ Pause ]│
 │ Tick rows (or Select all), then download. …                │
 └───────────────────────────────────────────────────────────┘
@@ -53,7 +53,7 @@ one dock, one list, one settings screen — while staying a *booru* tool:
 
 | Tab | What it does | Backing messages |
 | --- | --- | --- |
-| **Browse** | Active-tab card, "this post" card, fetch card, the list of rows | `routes/detect`, `posts/get`, `browse/search`, `queue/enqueuePosts`, `history/list` |
+| **Browse** | Active-tab card, "this post" card, fetch card, the list of rows | `routes/detect`, `posts/get`, `browse/search`, `queue/enqueuePosts`, `queue/enqueuePawchivePost`, `history/list` |
 | **Queue** | The same rows, focused on progress: retry failed, clear finished, reset history, clear list | `queue/list`, `queue/retryFailed`, `queue/clear`, `history/clear` |
 |  | Rows carry the media badge (`pic`/`video`), the canonical **rating chip**, the profile's site type and a `saved` badge | `queue/list` (rating is stored on the row at enqueue time) |
 | **Links** | Download **tasks** (one per creator) plus the raw link list: collect a creator's off-site links, download what is missing, rescan for new uploads, pause, export/import a package | `tasks/*`, `links/list`, `links/posts`, `links/scanPost`, `links/queue`, `links/remove`, `links/clear`, `links/export`, `links/import`, `queue/enqueueLinks` |
@@ -70,7 +70,8 @@ A row **is** a persisted `QueueItem` (`src/core/queue.ts`). That gives the panel
 for free:
 
 - state that survives closing the panel, reloading the page and restarting the
-  service worker (`running` rows are reset to `pending` on worker start);
+  service worker: browser IDs are persisted and reconciled instead of restarting
+  active transfers; selected pending work can resume;
 - de-duplication (`serverId:postId`) that spans every surface, so the popup and
   the content-script button cannot queue the same post twice;
 - one place where the rating filter is enforced.
@@ -89,9 +90,30 @@ Newly listed rows arrive ticked; a row you untick stays unticked across refreshe
 
 A mirror link is a queue row too, with two deliberate differences: it is keyed by
 its **URL** (`link:<url>`) instead of `serverId:postId`, and it skips the adapter,
-the post lookup and the rating filter - the file is off-site, so there is nothing
-to look up. That is what lets an imported package download on a fresh profile with
-no server configured at all, and why the same URL can never be queued twice.
+the post lookup and the rating filter - the file is off-site, so there is no booru post to look up. Direct URLs can run
+on a fresh profile; known share/landing pages are refused and should be opened
+or exported to a provider download manager. Unknown interstitials can still return HTML.
+
+## Pawchive attachments
+
+On a Pawchive post, **Add all available files** fetches the post and queues each
+available original attachment. Choose the queue rows and press **Download
+selected** to start them. The ordinary post download, popup and on-page button
+select one attachment (usually the first). Creator listings expand attachment
+slots, and the Links tab independently collects off-site URLs. Deferred or
+preview-only slots cannot be downloaded; post text/HTML and embedded-only images
+are not archived. New rows use attachment hash metadata when present to detect
+changed order, not to verify downloaded bytes. Remove and re-add any Pawchive
+queue rows from older versions because their indices may be ambiguous.
+
+**Transfer status:** Chrome's start response is not completion. The worker tracks
+Chrome download IDs and reports `done` only after Chrome says `complete`, or
+`failed` on interruption. Progress is polled from Chrome while the panel is open.
+If the ID was never persisted, or Chrome's record is missing, the result is
+`unverified` rather than automatically retried; inspect Chrome Downloads before
+retrying. A `done` file is not hash-checked and might be an HTML error page or
+later deleted. Queue workers and Pawchive pacing limit starts, not active browser
+transfers. The offline preview simulates completion and cannot test Chrome APIs.
 
 ## Settings reference
 
@@ -110,16 +132,17 @@ options page and the popup. Defaults in brackets.
 
 | Setting | What it does |
 | --- | --- |
-| **Downloads at once** [2] | Parallel download slots. The dock's segmented control writes the same value. |
+| **Queue start workers** [2] | Parallel workers preparing download starts, not a limit on active Chrome transfers. The dock control writes the same value. |
 | **Wait between requests to one server** [1 s] | Per-server spacing for API calls; adapters raise it when the site documents a hard limit (e621: 2 req/s), and the stricter value wins. |
 | **Retries per download** [3] | Retries for transient failures (network, 5xx, "slow down"). Auth and configuration errors are never retried. |
 | **If the file already exists** [`uniquify`] | Keep both (add a number) or overwrite. Passed straight to `chrome.downloads`. |
 
 ### 3. Multiple download → file rendition
 
-| Setting | What it does |
-| --- | --- |
-| **Quality** (`filePreference`) [`original`] | `original` downloads the file the site hosts; `sample` prefers the site's smaller sample rendition when it has one (`sampleUrl`), and silently falls back to the original when it does not. |
+Downloads are **original-only**. An old `filePreference: sample` setting is
+migrated to `original`; if the original is unavailable the operation fails rather
+than downloading a preview, sample or resized rendition. Thumbnails are display
+only. The extension does not verify downloaded bytes or the site's claims.
 
 ### 2b. Mirror links
 
@@ -136,14 +159,14 @@ options page and the popup. Defaults in brackets.
 | **Default media filter** [`all`] | `all` / `video` / `image` — what a fetch may add to the list. Still switchable per fetch in the listing card. |
 | **Pages per fetch** [150] | Hard cap on one crawl (`all` or `50-` selections stop there). |
 | **Queue rows shown** [60] | How many rows are drawn; the rest is summarised as "n more row(s) not drawn". Changes the view, never the run. |
-| **Skip posts already downloaded** [on] | Posts found in the download history are not listed again. With it off, rows that are already saved show a `saved` badge. |
+| **Skip posts previously completed** [off] | Hides only originals Chrome reported complete. Old start-only or unknown-quality entries remain stored but are ignored. Files may have been moved/deleted; reset history to list them again. Existing settings are preserved. |
 
 ### 5. Search behaviour
 
 | Setting | What it does |
 | --- | --- |
-| **Always append these tags** [`''`] | Global tag suffix, appended by the adapters to every search (de-duplicated case-insensitively, so typing a tag that is also in the suffix sends it once). |
-| **Never show these tags** [`''`] | Tag blacklist. Each token becomes `-tag` (the portable spelling on all three sites) and is removed from the positive side of your own queries. |
+| **Always append these tags** [`''`] | Global tag suffix, appended to booru searches and de-duplicated case-insensitively; it is not applied to Pawchive queries. |
+| **Never show these tags** [`''`] | Tag blacklist. On supported boorus each token becomes `-tag` and is removed from the positive side of your own queries. This does not filter Pawchive results. |
 | **Remember my searches** [on] | Recent queries appear under the search box and re-run with one click. |
 | **Searches remembered per server** [12] | Trim limit per server; `None` also stops new ones being stored. |
 
@@ -182,9 +205,8 @@ every setting** (servers and keys are never touched by a reset).
 
 ## Links tab: download tasks
 
-Creator archives (Kemono, Coomer, Pawchive) are the family where the real file is
-usually *not* on the site: the post body says "the pack is on Mega" and links
-there. Those URLs are not booru posts, so the ordinary listing cannot see them.
+Pawchive posts may refer to files that are *not* on the site: the post body
+says "the pack is on Mega" and links there. Those URLs are not booru posts, so the ordinary listing cannot see them.
 The Links tab turns them into a **task**: one creator on one site, the files that
 belong to them, and what happened to each one.
 
@@ -195,8 +217,8 @@ Links
 [ Collect links ]  [ Stop ]
   96 collected   61 to download   35 downloaded   3 failed
 ┌ 1245946 · fanbox        [pawchive] [fanbox]   partial - some files failed
-│ 35/41 file(s) saved · 3 failed · 3 still missing · scanned 2 hours ago
-│ last run 2 hours ago · 18 post(s) scanned · 6 new file(s) · 6 queued · 35 saved · 3 failed
+│ 35/41 file(s) completed · 3 failed · 3 still missing · scanned 2 hours ago
+│ last run 2 hours ago · 18 post(s) scanned · 6 new file(s) · 6 queued · 35 completed · 3 failed
 │ [ Download missing (6) ] [ Pause ] [ Rescan ] [ Export package ]        ✕
 │   ▸ (expand) one row per file, grouped by post, each with its own status
 └
@@ -206,7 +228,7 @@ Unfiled links   (a bare .txt import, a userscript export, a single URL)
 
 ### Collecting
 
-Pick a creator-archive profile, type a creator (`service/creatorId`, a creator
+Pick a Pawchive profile, type a creator (`service/creatorId`, a creator
 URL, `tag:name` or plain text), press *Collect links*. The panel asks the worker
 for one listing page (`links/posts`) and then walks the posts one at a time
 (`links/scanPost`), showing progress as it goes; *Stop* finishes the post in
@@ -222,21 +244,21 @@ which is what makes the rest work:
   an answer even after the panel was closed.
 
 Collecting the same creator again updates that task - new posts are added, nothing
-is duplicated, and a file you already have keeps its `done` state.
+is duplicated, and a browser-confirmed completion is retained (it does not verify contents).
 
 ### The task card
 
 | Control | What it does |
 | --- | --- |
-| **Download missing (n)** | Queues every file of the task that is not saved: new files **and** earlier failures. Files already downloaded are never fetched again (the card tells you how many it skipped). |
+| **Download missing (n)** | Queues new, failed and unverified links; browser-confirmed completions are skipped. Check unverified starts in Chrome Downloads before retrying to avoid duplicates. |
 | **Pause** | Drops the task's files that are still waiting in the queue and returns them to "not downloaded". A download already in flight is not interrupted. |
 | **Rescan** | Re-lists the creator, scans only posts it has not seen, and adds the files they link. |
 | **Export package** | Writes both halves (below). |
 | **✕** | Removes the task. Its files stay in the list, and anything downloaded stays on disk. |
 
-The card's status line is the completion summary: **complete** (every file saved),
-**partial** (some saved, some failed - the normal outcome against volunteer
-hosting), **failed**, **in-progress**, **idle** or **empty**.
+The card's status line summarizes Chrome outcomes: **all completed**, **partial**,
+**failed**, **downloading**, **idle** or **empty**. Completion does not establish
+that the file's contents are correct or that it still exists on disk.
 
 ### The package ("send it to a friend")
 
@@ -260,8 +282,8 @@ What the other side gets is deliberately unglamorous and predictable:
 - **one task**, named after the creator, with every file listed under its post;
 - the task is **idle** - nothing downloads until someone presses *Download
   missing* (which then honours their own "Start downloading immediately" setting);
-- files already saved on that machine are **skipped**, because a member's state
-  comes from the local link list, not from the file;
+- locally browser-confirmed completions are **skipped**; old start-only records
+  are unverified. A package from another machine does not prove a local file exists;
 - re-importing the same package merges into the existing task and reports what is
   new, what is known and what was unreadable;
 - nothing but the file crosses between the two people - no server, no account, no
@@ -277,7 +299,7 @@ under *Unfiled links*.
 
 | Store | Contents |
 | --- | --- |
-| `bsm.links` | The files: URL, provider, post context, status (`new`/`queued`/`done`/`failed`), saved filename, bytes, error. Capped at 20,000. |
+| `bsm.links` | The files: URL, provider, post context, status (`new`/`queued`/`done`/`failed`/`unverified`), saved filename, bytes, error. Capped at 20,000. |
 | `bsm.tasks` | The tasks: identity, member ids, posts already scanned, run history. Capped at 500 tasks / 5,000 files each. |
 
 Both are ordinary `chrome.storage.local` lists with the same promise as the queue:
@@ -286,9 +308,12 @@ mutation is serialised, so two queue workers finishing two files at the same
 moment cannot lose one another's status change. A task whose last file is gone
 (cleared, or removed by hand) is dropped, so no empty cards accumulate.
 
-Hosting pages that need a login or run a script (Drive folders, Mega landing
-pages) fail honestly: the file keeps the error, the task reads *partial*, and the
-exported list stays the reliable path for a dedicated download manager.
+Known provider share pages (e.g. Mega and Drive) are rejected before download;
+open or export those URLs for a provider downloader. Fragment keys are retained,
+so exported lists can be sensitive. Unknown provider pages and redirects can still
+produce HTML; the extension cannot verify their contents. Keyless old Mega links
+must be recollected or re-imported with the key; incremental *Rescan* does not
+revisit already-scanned posts, so use *Collect links* again for recovery.
 
 ### Why it is not a `.torrent`
 
@@ -305,9 +330,10 @@ was considered and parked.
 
 Two small stores (`src/core/history.ts`), both in `chrome.storage.local`:
 
-- `bsm.history` — successful downloads keyed `serverId:postId` (label, filename,
-  bytes, timestamp). Written by the queue on success, read by the listing card for
-  "skip downloaded"/the `saved` badge. Capped at 5000 entries.
+- `bsm.history` — Chrome-confirmed original downloads keyed `serverId:postId`
+  (label, filename, timestamp, quality and confirmation). Old start-only or
+  unknown-quality entries remain stored but cannot hide originals. No file hashes
+  are checked. Capped at 5000 entries.
 - `bsm.searches` — recent queries per server (capped by the setting, 500 overall).
 
 Neither contains credentials. The only thing "Reset download history" changes is
@@ -318,7 +344,7 @@ what the *listing* shows; nothing is deleted from disk.
 1. Load the unpacked `dist/` folder, then click the toolbar icon (or *Open side
    panel* in the options rail). The panel opens next to the page.
 2. On a booru page the context card names the matching profile; on a post page the
-   "this post" card offers **Download this post** / **Add to list**.
+   "this post" card offers **Download this file** / **Add to list**.
 3. Type tags, pick a page range, press **List this page** (or **Fetch selected
    pages** for a range). Rows appear ticked.
 4. Untick what you do not want, then press **Download selected** on the dock. The

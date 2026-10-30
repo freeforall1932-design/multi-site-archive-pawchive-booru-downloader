@@ -141,6 +141,8 @@ export interface PostCardState {
 export interface PostCardCallbacks {
   onDownload(): void;
   onAddToList(): void;
+  /** Available for Pawchive post pages, including when the first file is deferred. */
+  onAddAllPawchiveFiles?(): void;
   onReload(): void;
 }
 
@@ -163,7 +165,12 @@ export function renderPostCard(container: HTMLElement, state: PostCardState, cal
     container.appendChild(h('p', { class: 'psHint', text: state.error.message }));
     if (state.error.hint) container.appendChild(h('p', { class: 'psHint', text: state.error.hint }));
     container.appendChild(
-      h('div', { class: 'psActionRow' }, button('Try again', { variant: 'subtle', onClick: () => callbacks.onReload() })),
+      h('div', { class: 'psActionRow' },
+        button('Try again', { variant: 'subtle', onClick: () => callbacks.onReload() }),
+        callbacks.onAddAllPawchiveFiles ? button('Add all available files', {
+          disabled: state.busy, onClick: () => callbacks.onAddAllPawchiveFiles?.(),
+        }) : null,
+      ),
     );
     return;
   }
@@ -177,7 +184,7 @@ export function renderPostCard(container: HTMLElement, state: PostCardState, cal
   row.appendChild(
     h('img', {
       class: 'psPostThumb',
-      src: post.previewUrl,
+      src: post.previewUrl || undefined,
       alt: `Preview of post ${post.id}`,
       loading: 'lazy',
       on: { error: (event) => (event.target as HTMLImageElement).classList.add('psBroken') },
@@ -191,6 +198,7 @@ export function renderPostCard(container: HTMLElement, state: PostCardState, cal
       `#${post.id}`,
       ratingChip(post.rating),
       post.isVideo ? h('span', { class: 'psBadge psBadgeVideo', text: 'video' }) : null,
+      post.fileAvailability === 'preview' ? h('span', { class: 'psBadge', text: 'preview only' }) : null,
     ),
   );
   info.appendChild(
@@ -202,13 +210,19 @@ export function renderPostCard(container: HTMLElement, state: PostCardState, cal
   info.appendChild(h('span', { class: 'psMuted psTruncate', text: post.tags.slice(0, 8).join(' ') || '(no tags reported)' }));
   if (state.saved) {
     info.appendChild(
-      h('span', { class: 'psBadge psBadgeSaved', text: `saved ${relativeTime(state.saved.at)} — ${state.saved.filename}` }),
+      h('span', { class: 'psBadge psBadgeSaved', text: `completed ${relativeTime(state.saved.at)} — ${state.saved.filename}` }),
     );
   }
   if (state.queued) info.appendChild(h('span', { class: 'psBadge psBadgeQueued', text: 'already in the queue' }));
   row.appendChild(info);
   container.appendChild(row);
 
+  if (post.fileAvailability === 'preview' || !post.fileUrl) {
+    container.appendChild(h('p', {
+      class: 'psHint warn',
+      text: 'The original is unavailable. A preview may be displayed, but it will not be downloaded.',
+    }));
+  }
   if (state.blocked) {
     container.appendChild(
       h('p', {
@@ -222,9 +236,9 @@ export function renderPostCard(container: HTMLElement, state: PostCardState, cal
     h(
       'div',
       { class: 'psActionRow' },
-      button(state.busy ? 'Downloading…' : 'Download this post', {
+      button(state.busy ? 'Downloading…' : 'Download this file', {
         variant: 'primary',
-        disabled: state.busy || state.blocked,
+        disabled: state.busy || state.blocked || post.fileAvailability === 'preview' || !post.fileUrl,
         onClick: () => callbacks.onDownload(),
       }),
       button(state.queued ? 'In the queue' : 'Add to list', {
@@ -232,12 +246,20 @@ export function renderPostCard(container: HTMLElement, state: PostCardState, cal
         disabled: state.queued || state.busy,
         onClick: () => callbacks.onAddToList(),
       }),
+      callbacks.onAddAllPawchiveFiles ? button('Add all available files', {
+        variant: 'subtle',
+        disabled: state.busy,
+        title: 'Queue every available original attachment from this Pawchive post; external links are collected separately.',
+        onClick: () => callbacks.onAddAllPawchiveFiles?.(),
+      }) : null,
     ),
   );
   container.appendChild(
     h('p', {
       class: 'psHint',
-      text: '“Add to list” only adds the row - nothing is downloaded until you press Download selected on the dock.',
+      text: callbacks.onAddAllPawchiveFiles
+        ? 'The first button downloads one file. “Add all” lists this post’s available originals; external links are separate. Press Download selected to start.'
+        : '“Add to list” only adds the row - nothing is downloaded until you press Download selected on the dock.',
     }),
   );
 }

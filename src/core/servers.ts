@@ -1,11 +1,23 @@
 import { BooruError } from '../shared/errors.js';
 import type { Rating, ServerConfig, ServerConfigView, ValidationResult } from '../shared/types.js';
 import { ALL_RATINGS } from '../shared/types.js';
-import { createId, deepClone, maskSecret, normalizeBaseUrl, unique } from '../shared/util.js';
+import { createId, deepClone, isValidHttpUrl, maskSecret, normalizeBaseUrl, unique } from '../shared/util.js';
 import { getAdapter, requireAdapter } from './registry.js';
 import { STORAGE_KEYS, type StorageArea } from './storage.js';
 
 export type ServerListener = (servers: ServerConfig[]) => void;
+
+/** Whether a stored profile can be used, without discarding unsupported data. */
+export function isUsableServer(server: Pick<ServerConfig, 'siteType' | 'baseUrl'>): boolean {
+  const adapter = getAdapter(server.siteType);
+  if (!adapter) return false;
+  try {
+    const url = adapter.normalizeBaseUrl ? adapter.normalizeBaseUrl(server.baseUrl) : server.baseUrl;
+    return isValidHttpUrl(normalizeBaseUrl(url));
+  } catch {
+    return false;
+  }
+}
 
 /** Fields whose change invalidates a previous validation run. */
 const VALIDATION_INVALIDATING_FIELDS: Array<keyof ServerConfig> = [
@@ -54,7 +66,10 @@ export class ServerStore {
   async list(): Promise<ServerConfig[]> {
     if (!this.cache) {
       const stored = await this.area.get<unknown>(STORAGE_KEYS.servers);
-      this.cache = Array.isArray(stored) ? stored.map((entry) => this.normalizeStored(entry)) : [];
+      const servers = Array.isArray(stored) ? stored.map((entry) => this.normalizeStored(entry)) : [];
+      // Keep retired profiles available for export/deletion, but never let one
+      // remain the default when a supported Pawchive or booru profile exists.
+      this.cache = this.withSupportedDefault(servers);
     }
     return this.cache.map((entry) => deepClone(entry));
   }
@@ -71,7 +86,7 @@ export class ServerStore {
 
   async getDefault(): Promise<ServerConfig | null> {
     const servers = await this.list();
-    return servers.find((server) => server.isDefault) ?? servers[0] ?? null;
+    return servers.find((server) => server.isDefault && isUsableServer(server)) ?? servers.find(isUsableServer) ?? null;
   }
 
   async count(): Promise<number> {
@@ -123,7 +138,7 @@ export class ServerStore {
       customUserAgent: (input.customUserAgent ?? existing?.customUserAgent ?? '').trim(),
       // `true` promotes this profile; `false` never demotes an existing default,
       // and the very first saved profile becomes the default automatically.
-      isDefault: input.isDefault === true ? true : existing?.isDefault ?? servers.length === 0,
+      isDefault: input.isDefault === true ? true : existing?.isDefault ?? !servers.some((server) => server.isDefault),
       validationStatus: existing?.validationStatus ?? 'unknown',
       validationMessage: existing?.validationMessage ?? '',
       lastValidatedAt: existing?.lastValidatedAt ?? null,
@@ -152,9 +167,6 @@ export class ServerStore {
   async remove(id: string): Promise<ServerConfig[]> {
     const servers = await this.list();
     const remaining = servers.filter((server) => server.id !== id);
-    if (remaining.length && !remaining.some((server) => server.isDefault)) {
-      remaining[0] = { ...remaining[0]!, isDefault: true };
-    }
     return this.persist(remaining);
   }
 
@@ -181,8 +193,15 @@ export class ServerStore {
 
   async setDefault(id: string): Promise<ServerConfig[]> {
     const servers = await this.list();
-    if (!servers.some((server) => server.id === id)) {
+    const target = servers.find((server) => server.id === id);
+    if (!target) {
       throw new BooruError(`Cannot set unknown server ${id} as default`, { kind: 'unknown' });
+    }
+    const adapter = requireAdapter(target.siteType);
+    if (!isUsableServer(target)) {
+      // Preserve the adapter's more specific error, if it supplies one.
+      adapter.normalizeBaseUrl?.(target.baseUrl);
+      throw new BooruError('This server has an invalid base URL', { kind: 'incomplete-config' });
     }
     return this.persist(this.promoteDefault(servers, id));
   }
@@ -328,11 +347,18 @@ export class ServerStore {
     const siteType = typeof raw.siteType === 'string' ? raw.siteType : '';
     const adapter = getAdapter(siteType);
     const baseUrl = typeof raw.baseUrl === 'string' ? raw.baseUrl : '';
+    let normalizedBaseUrl = baseUrl;
+    try {
+      if (adapter) normalizedBaseUrl = normalizeBaseUrl(adapter.normalizeBaseUrl ? adapter.normalizeBaseUrl(baseUrl) : baseUrl) || baseUrl;
+    } catch {
+      // A retired/invalid profile must not prevent the rest from loading. It
+      // remains visible for export or removal, and requests still reject it.
+    }
     return {
       id: typeof raw.id === 'string' && raw.id ? raw.id : createId('srv'),
       label: typeof raw.label === 'string' && raw.label ? raw.label : (adapter?.displayName ?? siteType) || 'Server',
       siteType,
-      baseUrl: adapter ? normalizeBaseUrl(adapter.normalizeBaseUrl ? adapter.normalizeBaseUrl(baseUrl) : baseUrl) || baseUrl : baseUrl,
+      baseUrl: normalizedBaseUrl,
       ratingFilterEnabled: raw.ratingFilterEnabled ?? true,
       username: raw.username ?? '',
       apiKey: raw.apiKey ?? '',
@@ -350,8 +376,14 @@ export class ServerStore {
     };
   }
 
+  private withSupportedDefault(servers: ServerConfig[]): ServerConfig[] {
+    const supported = servers.filter(isUsableServer);
+    const chosen = supported.find((server) => server.isDefault) ?? supported[0];
+    return servers.map((server) => ({ ...server, isDefault: server.id === chosen?.id }));
+  }
+
   private async persist(servers: ServerConfig[]): Promise<ServerConfig[]> {
-    const sorted = sortServers(servers);
+    const sorted = sortServers(this.withSupportedDefault(servers));
     this.cache = sorted;
     await this.area.set(STORAGE_KEYS.servers, sorted);
     this.listeners.forEach((listener) => listener(sorted.map((server) => deepClone(server))));

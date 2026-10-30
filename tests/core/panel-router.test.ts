@@ -191,16 +191,17 @@ describe('panel router - selective queue control', () => {
 });
 
 describe('panel router - preferences that reach the download path', () => {
-  it('prefers the sample rendition when the setting asks for it', async () => {
+  it('migrates a legacy sample preference and downloads the original', async () => {
     const harness = createHarness({ settings: { filePreference: 'sample', minRequestIntervalMs: 0 } });
     await harness.seed({ seedServers: [e621Server()] });
     const server = (await harness.servers.getDefault())!;
-    const result = await ok<{ filename: string }>(harness, {
+    const result = await ok<{ filename: string; post: { fileUrl: string } }>(harness, {
       type: 'posts/download',
       payload: { serverId: server.id, postId: String(MOCK_POSTS[0]!.id) },
     });
+    expect((await harness.settings.get()).filePreference).toBe('original');
     expect(result.filename).toContain('booru/e621/');
-    expect(harness.downloader.log[0]!.url).toMatch(/sample|mock/);
+    expect(harness.downloader.log[0]!.url).toBe(result.post.fileUrl);
   });
 
   it('overwrites instead of uniquifying when the setting asks for it', async () => {

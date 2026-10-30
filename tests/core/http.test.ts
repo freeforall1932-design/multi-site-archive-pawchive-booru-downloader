@@ -164,6 +164,20 @@ describe('HttpClient', () => {
     expect(events.join(' ')).not.toContain('super-secret');
   });
 
+  it('redacts keys when a network error embeds a complete sensitive URL', async () => {
+    const events: string[] = [];
+    const url = 'https://t1.pawchive.pw/f/file?s=signed-secret#fragment-secret';
+    const http = client(async () => { throw new TypeError(`Unable to fetch ${url}`); }, {
+      maxRetries: 1,
+      onEvent: (event) => events.push(`${event.url} ${event.message ?? ''}`),
+    });
+    const error = await http.request({ url }).catch((caught: Error) => caught);
+    expect(String(error)).not.toContain('signed-secret');
+    expect(String(error)).not.toContain('fragment-secret');
+    expect(events.join(' ')).not.toContain('signed-secret');
+    expect(events.join(' ')).not.toContain('fragment-secret');
+  });
+
   it('surfaces request/response events for diagnostics', async () => {
     const events: string[] = [];
     const http = client(async () => jsonResponse({}), {

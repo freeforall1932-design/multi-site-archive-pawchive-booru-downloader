@@ -7,8 +7,8 @@ import { DEFAULT_SETTINGS } from '../../src/shared/types.js';
 import { createServerConfig } from '../../src/core/servers.js';
 import { redactUrl } from '../../src/shared/util.js';
 
-/** Post ids are opaque per site; Kemono/Coomer use `service/creator/post` composites. */
-const SAMPLE_POST_ID: Record<string, string> = { kemono: 'patreon/90822862/147648418', coomer: 'onlyfans/demo/123', pawchive: 'fanbox/1245946/12674481' };
+/** Post ids are opaque per site; Pawchive uses service/creator/post composites. */
+const SAMPLE_POST_ID: Record<string, string> = { pawchive: 'fanbox/1245946/12674481' };
 const samplePostId = (siteType: string) => SAMPLE_POST_ID[siteType] ?? '123';
 
 registerBuiltinAdapters();
@@ -25,7 +25,7 @@ describe('adapter contract conformance', () => {
 
   it('registers the three original site types plus the added families', () => {
     expect(knownSiteTypes()).toEqual(
-      expect.arrayContaining(['e621', 'danbooru', 'gelbooru', 'rule34', 'safebooru-org', 'yandere', 'konachan', 'derpibooru', 'hydrus', 'kemono']),
+      expect.arrayContaining(['e621', 'danbooru', 'gelbooru', 'rule34', 'safebooru-org', 'yandere', 'konachan', 'derpibooru', 'hydrus', 'pawchive']),
     );
   });
 
@@ -100,7 +100,7 @@ describe('adapter contract conformance', () => {
 
   it.each(adapters.map((adapter) => [adapter.siteType, adapter] as const))('%s maps every site rating token to a canonical rating', (_siteType, adapter) => {
     if (!adapter.capabilities.supportsRatingFilter) {
-      // Sites without ratings (Hydrus, Kemono) must say so and stay inert.
+      // Sites without ratings (Hydrus, Pawchive) must say so and stay inert.
       expect(adapter.siteRatingTokens).toHaveLength(0);
       expect(adapter.ratingQueryTags([]).tags).toHaveLength(0);
       expect(adapter.normalizeRating('anything')).toBe('unknown');

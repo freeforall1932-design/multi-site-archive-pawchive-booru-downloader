@@ -1,4 +1,4 @@
-import { RecordingDownloader, type Downloader, type DownloadRequest, type DownloadOutcome } from '../core/downloads.js';
+import { RecordingDownloader, type Downloader, type DownloadRequest, type DownloadOutcome, type DownloadSnapshot } from '../core/downloads.js';
 import type { RouterResponse, UiRequest } from '../core/messages.js';
 import { WebStorageArea, type StorageArea } from '../core/storage.js';
 import type { Platform } from './types.js';
@@ -6,23 +6,30 @@ import type { Platform } from './types.js';
 /** `localStorage` namespace the preview harness resets and documents. */
 export const PREVIEW_STORAGE_NAMESPACE = 'bsm-preview';
 
+/** Map an arbitrary demo URL to a local synthetic asset, never a live site. */
+export function previewMediaUrl(url: string): string {
+  if (/^\/mock\/media\/\d+\.(?:jpg|png)$/.test(url)) return url;
+  let hash = 2166136261;
+  for (let i = 0; i < url.length; i += 1) hash = Math.imul(hash ^ url.charCodeAt(i), 16777619);
+  return `/mock/media/${hash >>> 0}.jpg`;
+}
+
 /**
- * Downloader used by the browser preview: it performs a real browser download of
- * the (mock) media URL and also records it so the preview can display a log.
+ * Preview-only downloader. The anchor uses local synthetic media; its completion
+ * is simulated because normal web pages cannot observe browser download state.
  */
 export class PreviewDownloader implements Downloader {
   private readonly recorder = new RecordingDownloader();
-  private nextId = 1;
 
   get log() {
     return this.recorder.log;
   }
 
   async download(request: DownloadRequest): Promise<DownloadOutcome> {
-    await this.recorder.download(request);
+    const outcome = await this.recorder.download(request);
     try {
       const anchor = document.createElement('a');
-      anchor.href = request.url;
+      anchor.href = previewMediaUrl(request.url);
       anchor.download = request.filename.split('/').pop() ?? 'download';
       anchor.target = '_blank';
       anchor.rel = 'noopener';
@@ -32,7 +39,15 @@ export class PreviewDownloader implements Downloader {
     } catch {
       /* preview only */
     }
-    return { downloadId: this.nextId++, viaFallback: false, bytes: null };
+    return outcome;
+  }
+
+  getState(downloadId: number): Promise<DownloadSnapshot | null> {
+    return this.recorder.getState(downloadId);
+  }
+
+  cancel(downloadId: number): Promise<void> {
+    return this.recorder.cancel(downloadId);
   }
 }
 
@@ -94,7 +109,7 @@ export class PreviewPlatform implements Platform {
     return {
       Environment: 'browser preview (no extension APIs)',
       Storage: 'localStorage namespace "bsm-preview"',
-      Downloads: 'browser download of mock media',
+      Downloads: 'mock media; completion is simulated, not observed from Chrome',
       'User-Agent rewriting': 'disabled in preview',
     };
   }

@@ -1,5 +1,5 @@
 import { BooruError } from './errors.js';
-import { redactHeaders, redactUrl, sleep } from './util.js';
+import { redactHeaders, redactUrl, redactUrlsInText, sleep } from './util.js';
 
 export type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
 
@@ -206,7 +206,7 @@ export class HttpClient {
         }
         const isTimeout = error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError');
         lastError = new BooruError(
-          isTimeout ? `Request timed out after ${spec.timeoutMs ?? this.defaultTimeoutMs}ms` : `Network request failed: ${(error as Error).message}`,
+          isTimeout ? `Request timed out after ${spec.timeoutMs ?? this.defaultTimeoutMs}ms` : `Network request failed: ${redactUrlsInText(error instanceof Error ? error.message : String(error))}`,
           { kind: 'network-failure', cause: error },
         );
         this.emit({ type: 'error', url: spec.url, method, attempt, durationMs, message: lastError.message });

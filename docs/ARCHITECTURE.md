@@ -1,9 +1,9 @@
 # Architecture
 
 A Manifest V3 extension with strictly layered code. The rule that shapes
-everything else: **the UI and the shared services never branch on site type** —
-site-specific knowledge lives inside adapters, and every surface talks to the
-shared booru services through one message protocol.
+everything else: site-specific API mappings live inside adapters, while shared
+services enforce cross-site safety policy and expose explicit Pawchive attachment
+actions. Every surface talks to those services through one message protocol.
 
 ```
 ┌──────────────────────────── UI surfaces ────────────────────────────┐
@@ -49,9 +49,9 @@ shared booru services through one message protocol.
 | `http.ts` | `HttpClient` (timeouts, retry with backoff, per-key `RateLimiter`), `HttpRequestSpec`, `HttpResponseSnapshot`, `parseJsonBody`, `describeRequest` |
 | `util.ts` | ids, deep clone/deep merge, `sleep`, `redactUrl`, `redactHeaders`, host/path helpers, amount formatting |
 
-`HttpClient` is the only place that performs network I/O, and it is the only place
-that can leak a credential: every snapshot it produces carries a `redactedUrl`, and
-its event stream is redacted before it is emitted.
+`HttpClient` handles API network I/O; Chrome downloads and UI thumbnails also
+contact remote hosts. Each HTTP snapshot carries a `redactedUrl`, and its event
+stream is redacted before it is emitted.
 
 ### 2. `src/core/` — shared services
 
@@ -64,7 +64,7 @@ its event stream is redacted before it is emitted.
 | `servers.ts` | `ServerStore`: CRUD, default handling, duplicate (secrets copied, validation reset), credential clearing, masking (`toServerView`), JSON export/import, validation bookkeeping |
 | `settings.ts` | `SettingsStore`: defaults, partial saves, reset, migration-safe merge (including the side-panel keys: `uiMode`, `panelDefaultTab`, `mediaFilter`, `skipDownloaded`, `pageRangeLimit`, `queueRowLimit`, `showThumbnails`, `autoStartQueue`, `duplicateBehaviour`, `filePreference`, `tagBlacklist`, `searchHistory*`, `mirrorLinksFilter`, `mirrorExtraHosts`, `mirrorFolderTemplate`) |
 | `history.ts` | `DownloadHistoryStore` + `SearchHistoryStore`: the panel's two notebooks (`bsm.history`, `bsm.searches`) |
-| `search.ts` | `composeSearchTags`: tag blacklist + global suffix applied to every query |
+| `search.ts` | `composeSearchTags`: tag blacklist + global suffix for booru queries (not Pawchive creator/title queries) |
 | `pages.ts` | `parsePageRange` / `fromToRange` / `batchRange`: the listing card's page grammar (`2,4,6-10`, `50-`, `all`) with the configured cap |
 | `template.ts` | Filename-template token catalog, canonical-template detection, preview rendering |
 | `validation.ts` | `ValidationService`: runs an adapter's ordered probes, classifies results, produces a `ValidationResult` with a redacted trace |
@@ -75,7 +75,7 @@ its event stream is redacted before it is emitted.
 | `tasks.ts` | Download tasks (pure): ids from site+service+creator, statistics and completion (`complete`/`partial`/`failed`/`in-progress`), run planning (`missing` = new + retries, `all`), and the package manifest reader/writer |
 | `task-store.ts` | `TaskStore` (`bsm.tasks`): create-or-merge tasks, attach files after a scan, run history, and closing a run when the last of a task's files settles |
 | `naming.ts` | Template tokens, `renderTemplate`, `sanitizePathSegment`, `sanitizeFolderPath`, `buildDownloadPath` (traversal + length safety, warnings) and `buildMirrorPath` (the URL-shaped tokens link rows use) |
-| `downloads.ts` | `Downloader` interface, `ChromeDownloader`, `RecordingDownloader` |
+| `downloads.ts` | `Downloader`, `ChromeDownloader`, `RecordingDownloader`, original-only guard and Pawchive file-start pacing |
 | `userAgent.ts` | Builds and syncs `declarativeNetRequest` dynamic User-Agent rules from the saved profiles |
 | `router.ts`, `messages.ts` | The message protocol and the single request handler |
 
@@ -141,14 +141,14 @@ is always `{ ok: true, data }` or `{ ok: false, error: { message, kind, hint } }
 ```
 servers/  list · save · remove · duplicate · setDefault · validate · validateDraft
           clearCredentials · export · import
-browse/   search                      (adds the tag blacklist before the adapter sees it)
+browse/   search                      (adds the booru tag blacklist; Pawchive queries stay unchanged)
 links/    list · posts · scanPost · queue · remove · clear · export · import
           (the Links tab: one listing page → one scan per post → durable list)
 tasks/    list · begin · import · export · run · pause · rescan · remove
           (one task per creator: start it, pause it, rescan it, package it)
 posts/    get · resolveUrl · download
 routes/   detect
-queue/    list · enqueue · enqueuePosts · enqueueLinks · run · pause · resume
+queue/    list · enqueue · enqueuePosts · enqueuePawchivePost · enqueueLinks · run · pause · resume
           retryFailed · clear · cancel · remove
           (run accepts { itemIds } - "Download selected")
 history/  list · remove · clear        (the download notebook)
@@ -159,8 +159,9 @@ diagnostics/info · userAgent/sync
 
 Rules enforced by the router:
 
-- No response containing a secret: servers cross the boundary as
-  `ServerConfigView` (`apiKeyMask` + `hasApiKey` only).
+- Server credentials cross the boundary only as `ServerConfigView`
+  (`apiKeyMask` + `hasApiKey`). Collected share URLs intentionally retain their
+  fragments and may contain private keys; exports are sensitive.
 - `queue/run` and `queue/resume` are fire-and-forget; the UI polls
   `queue/list` (1.5 s in the options page, 1.2 s in the side panel) so a long
   download never blocks a message channel. `queue/run` takes an optional
@@ -211,6 +212,7 @@ UI → router.browse/search → BooruClient.search
 posts/download { url | postId, serverId? }
   ├─ url  → adapter.matchRoute → resolve saved server → adapter.buildPostRequest
   ├─ enforce rating filter (if enabled in settings)
+  ├─ requireOriginalFile (never substitute sample or preview)
   ├─ buildDownloadPath (templates → sanitised folder + filename)
   └─ Downloader.download → chrome.downloads (conflictAction: uniquify)
 ```
@@ -223,8 +225,9 @@ posts/download many → queue/enqueuePosts → DownloadQueue.enqueue
    └─ persist
 
 queue/run → worker loop (maxConcurrency)
-   per item: resolve server → adapter.buildPostRequest → parse → naming
-             → Downloader.download → status done/failed/skipped + error kind
+   per item: resolve server → adapter.buildPostRequest → parse → require original
+             → verify supplied Pawchive attachment identity → naming
+             → Downloader.download → persist Chrome ID → onChanged/search → complete/interrupted/unverified
 ```
 
 **Mirror-link collection** (the Links tab)
@@ -242,7 +245,8 @@ links/scanPost { serverId, postId, postUrl?, postTitle?, creator? }
 links/queue → queue.enqueueLinks      → one `link` row per URL (`link:<url>`)
 links/export / links/import           → formatLinkExport / parseLinkExport (round-trip)
 
-queue/run, link row → buildMirrorPath (URL tokens) → Downloader.download
+queue/run, link row → reject known provider share pages → buildMirrorPath
+                    → Downloader.download (direct URLs only)
   └─ no server, no adapter, no rating filter; the outcome is synced back to
      bsm.links, and the owning task's run is closed once nothing of it waits
 ```
@@ -271,16 +275,29 @@ tasks/import  { text, filename }  → parseTaskPackage: either half, by content
 | --- | --- |
 | `bsm.servers` | `ServerConfig[]` — credentials + validation state + rating allow-list |
 | `bsm.settings` | `ExtensionSettings` — templates, concurrency, intervals, toggles |
-| `bsm.queue` | `{ items: QueueItem[], paused: boolean }` — the panel's row list *is* this list |
-| `bsm.history` | `DownloadHistoryEntry[]` (newest first, capped at 5000) — powers "skip downloaded" |
+| `bsm.queue` | `{ items: QueueItem[], paused: boolean, scheduledIds: string[] }` — queue rows, browser IDs/progress and the persisted run selection |
+| `bsm.history` | `DownloadHistoryEntry[]` (newest first, capped at 5000) — only original-quality browser-confirmed completions power optional skip; old entries remain but are ignored |
 | `bsm.searches` | `SearchHistoryEntry[]` — recent queries per server (capped by the setting) |
 | `bsm.links` | `MirrorLink[]` — files collected by the Links tab, with their post context and download outcome (capped at 20,000) |
 | `bsm.tasks` | `DownloadTask[]` — one per creator: identity, member file ids, posts already scanned, run history (capped at 500) |
 | `bsm.meta` | `{ schemaVersion, firstRunAt }` |
 
-`migrateStorage()` runs on install/update and is the single place to react to a
-schema bump. In-flight queue items are reset from `running` to `pending` on worker
-start, so a browser restart never loses work or leaves stuck rows.
+`migrateStorage()` runs on install/update. Queue loading conservatively migrates
+legacy start-only `done` rows to `unverified`; legacy original-quality history is
+retained but cannot hide originals without the completion marker. In-flight rows
+with a Chrome ID are reconciled by `downloads.search({id})`, not reset to pending.
+If a worker dies after initiating a start but before saving its ID, the result is
+unverified rather than automatically duplicated. Missing browser records are also
+unverified. The scheduled selection is persisted before workers start.
+
+Queue, link, task and history `done` require Chrome's `complete` state; interruptions
+are retryable failures. A completion is not a byte/hash or content check, and the
+file may later disappear. Side effects are written idempotently and failed notebook
+writes are retried without another download. Pawchive metadata and file-start
+pacing are shared across aliases; active transfers are not capped. Old Pawchive
+queue indices are blocked until removed/re-added; expected file hashes on new rows
+detect metadata changes, not byte integrity. Mega fragments are kept in
+stored/exported links and redacted in diagnostic URLs.
 
 ## Service worker lifetime
 
@@ -291,12 +308,15 @@ MV3 workers are killed aggressively, so the worker owns no durable state:
 - on `storage.onChanged` for servers/settings/history/searches: caches
   invalidated, User-Agent rules re-synced, toolbar behaviour re-applied;
 - on `runtime.onMessage`: one router call per request;
-- the queue reads its state from storage on first use, persists after every
-  transition, and is re-runnable at any time.
+- `downloads.onChanged` and `onErased` are registered synchronously on worker
+  load; a post-start search closes the event-before-ID-persistence race;
+- queue recovery searches tracked browser IDs and resumes the stored run plan.
+  The panel polls search for byte progress because `onChanged` does not stream it;
+- cancellation requests call Chrome, and active rows cannot be removed or cleared.
 
 The UI never talks to an adapter or the network directly; it only sends messages.
-In the preview harness the same router runs in the page, which is why the preview
-behaves identically to the extension.
+In the preview harness the same router runs in the page, but downloads and their
+completion are simulated: a web page cannot observe Chrome extension download state.
 
 ## User-Agent strategy
 

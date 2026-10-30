@@ -316,12 +316,13 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 15));
     listed = await expectOk({ type: 'queue/list' });
   }
-  check('queue drained through the router', listed.summary.done === 3, JSON.stringify(listed.summary));
+  check('queue drained through the router', listed.summary.done === queued.summary.done + 3, JSON.stringify(listed.summary));
+  check('direct and queued rows report simulated completion in preview', listed.items.every((item) => item.status === 'done' && item.completion === 'browser-complete'), JSON.stringify(listed.items.map((item) => item.status)));
 
   // ------------------------------------------------ panel-specific protocol bits
   const history = await expectOk({ type: 'history/list' });
   check('download history records the queue run', history.total >= 3, `total=${history.total}`);
-  check('history entries carry the saved path', history.entries.every((entry) => entry.filename.includes('/')), JSON.stringify(history.entries[0] ?? {}));
+  check('history entries carry the requested path', history.entries.every((entry) => entry.filename.includes('/')), JSON.stringify(history.entries[0] ?? {}));
 
   await expectOk({ type: 'searches/add', payload: { serverId: servers[0].id, query: 'cityscape solo' } });
   const searches = await expectOk({ type: 'searches/list', payload: { serverId: servers[0].id } });
@@ -343,7 +344,7 @@ async function main() {
   // ------------------------------------------------------------------ settings
   const settings = await expectOk({ type: 'settings/save', payload: { folderTemplate: 'smoke/{siteType}' } });
   check('settings persist', settings.folderTemplate === 'smoke/{siteType}');
-  check('panel defaults are part of the stored settings', settings.uiMode === 'sidepanel' && settings.pageRangeLimit === 150 && settings.skipDownloaded === true);
+  check('panel defaults are part of the stored settings', settings.uiMode === 'sidepanel' && settings.pageRangeLimit === 150 && settings.skipDownloaded === false);
   const panelPrefs = await expectOk({ type: 'settings/save', payload: { uiMode: 'popup', mediaFilter: 'video', tagBlacklist: '-guro vore' } });
   check('panel preferences round-trip', panelPrefs.uiMode === 'popup' && panelPrefs.mediaFilter === 'video' && panelPrefs.tagBlacklist === 'guro vore', JSON.stringify(panelPrefs));
   const afterReload = await expectOk({ type: 'settings/get' });
@@ -355,7 +356,7 @@ async function main() {
   const siteTypes = new Set(info.adapters.map((entry) => entry.siteType));
   check(
     'diagnostics list every built-in adapter family',
-    ['e621', 'danbooru', 'gelbooru', 'rule34', 'safebooru-org', 'yandere', 'konachan', 'derpibooru', 'hydrus', 'kemono'].every((type) => siteTypes.has(type)),
+    ['e621', 'danbooru', 'gelbooru', 'rule34', 'safebooru-org', 'yandere', 'konachan', 'derpibooru', 'hydrus', 'pawchive'].every((type) => siteTypes.has(type)),
   );
   check('diagnostics contain no secrets', !JSON.stringify(info).includes('e621-demo-key') && !JSON.stringify(info).includes('Authorization'));
 
@@ -431,11 +432,11 @@ async function bootPanel(registry, servers, postId) {
   );
   check('context card names the matching profile', /e621/.test(contextText()), contextText().slice(0, 160));
 
-  const postCardReady = await waitFor(() => /Download this post/i.test(contextText()), 4000);
+  const postCardReady = await waitFor(() => /Download this file/i.test(contextText()), 4000);
   check('post card resolves the post through the protocol', postCardReady, contextText().slice(0, 220));
   check(
     'post card offers the single-post actions',
-    /Download this post/i.test(contextText()) && /Add to list/i.test(contextText()),
+    /Download this file/i.test(contextText()) && /Add to list/i.test(contextText()),
     contextText().slice(0, 200),
   );
 
@@ -511,6 +512,29 @@ async function walkTabs(registry) {
   tabs[0]?.fire('click');
   await driveListing(registry);
   await driveLinks(registry);
+  await drivePawchivePost(registry);
+}
+
+/** Exercise the actual post-card button, not only its router message. */
+async function drivePawchivePost(registry) {
+  globalThis.location.search = `?tab=${encodeURIComponent('https://pawchive.pw/fanbox/user/1245946/post/12674481')}`;
+  const context = () => registry.get('context-host') ?? createElement();
+  const refresh = context().find((node) => node.tagName === 'BUTTON' && node.getAttribute('title') === 'Re-read the active tab');
+  if (!refresh) {
+    check('Pawchive post card can be opened', false, 'active-tab refresh button not found');
+    return;
+  }
+  refresh.fire('click');
+  const ready = await waitFor(() => /Add all available files/i.test(collectText(context())), 10000);
+  check('Pawchive post card can be opened', ready, collectText(context()).slice(0, 240));
+  const addAll = context().find((node) => node.tagName === 'BUTTON' && /Add all available files/i.test(node.textContent ?? ''));
+  if (!addAll) return;
+  addAll.fire('click');
+  const queued = await waitFor(() => /2 original file\(s\) added/i.test(collectText(registry.get('dock-host') ?? createElement())), 10000);
+  check('Pawchive post card queues every available original', queued, collectText(registry.get('dock-host') ?? createElement()).slice(0, 240));
+  const list = await previewSend?.({ type: 'queue/list' });
+  const rows = list?.ok ? list.data.items.filter((item) => item.postId.startsWith('fanbox/1245946/12674481/')) : [];
+  check('Pawchive all-files action does not start downloads', rows.length === 2 && rows.every((item) => item.status === 'pending'));
 }
 
 /**
@@ -555,7 +579,7 @@ async function driveLinks(registry) {
   check('links tab collects the demo creator into one task', found, text().slice(0, 260));
   check(
     'the task card names the creator and counts its files',
-    /1245946 · fanbox/.test(text()) && /\d+\/\d+ file\(s\) saved/i.test(text()),
+    /1245946 · fanbox/.test(text()) && /\d+\/\d+ file\(s\) completed/i.test(text()),
     text().slice(0, 260),
   );
   check('the task says how many files are still missing', downloaded() > 0, text().slice(0, 260));
@@ -607,7 +631,7 @@ async function driveLinks(registry) {
 
   const run = await previewSend?.({ type: 'tasks/run', payload: { taskId: first?.task.id, start: false } });
   check(
-    'Download missing queues exactly the files that are not saved yet',
+    'Download missing queues exactly the files not yet marked completed',
     run?.ok === true && run.data.queued === run.data.plan.total && run.data.plan.alreadyDone === 0,
     JSON.stringify(run?.ok ? run.data.plan : run?.error),
   );
@@ -644,7 +668,7 @@ async function driveListing(registry) {
   check('panel lists the typed query through the protocol', listed, summary().slice(0, 200));
   check('listed rows carry a rating chip', /safe|questionable|explicit|general|sensitive/i.test(summary()), summary().slice(0, 200));
   check('listed rows offer the download action', /Download selected/i.test(collectText(registry.get('dock-host') ?? createElement())));
-  // Listing must not download: the rows are queued, nothing has completed yet.
+  // Listing must not download: the rows are queued, no downloads have started yet.
   const summaryNow = () => collectText(registry.get('browse-list-host') ?? createElement());
   check(
     'listing queues the rows without downloading them',

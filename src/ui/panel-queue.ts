@@ -4,7 +4,7 @@
  *
  * Row anatomy, borrowed from the sister side panels:
  *
- *   [x] [thumb]  #1500000  [video] [saved]        completed    [×]
+ *   [x] [thumb]  #1500000  [video] [completed]      completed      [×]
  *                e621 · 4.2 MB · bsm/folder/file.jpg
  *                [====== progress ======]
  *
@@ -75,6 +75,11 @@ export function renderQueueList(container: HTMLElement, state: QueueListState, c
     ),
   );
 
+  container.appendChild(h('p', { class: 'psHint warn', text: 'Completed means Chrome reported the transfer complete; file contents are not verified. Older starts are unverified.' }));
+  if (summary.unverified) {
+    container.appendChild(h('p', { class: 'psHint warn', text: `${summary.unverified} unverified row(s): check Chrome Downloads before retrying to avoid duplicates.` }));
+  }
+
   // --------------------------------------------------------------- toolbars
   const selectedCount = state.rows.filter((row) => row.selected).length;
   container.appendChild(
@@ -112,22 +117,22 @@ export function renderQueueList(container: HTMLElement, state: QueueListState, c
       h('button', {
         class: 'psTextButton',
         type: 'button',
-        text: `Retry failed (${summary.failed + summary.skipped})`,
-        disabled: summary.failed + summary.skipped === 0,
+        text: `Retry failed / unverified (${summary.failed + summary.skipped + summary.unverified})`,
+        disabled: summary.failed + summary.skipped + summary.unverified === 0,
         onClick: () => callbacks.onRetryFailed(),
       }),
       h('button', {
         class: 'psTextButton',
         type: 'button',
         text: 'Clear finished',
-        title: 'Remove completed and failed rows, keep the rest.',
+        title: 'Remove completed rows, keeping active and unverified rows.',
         onClick: () => callbacks.onClearFinished(),
       }),
       h('button', {
         class: 'psTextButton',
         type: 'button',
         text: 'Reset history',
-        title: 'Forget which posts were already downloaded, so they can be listed again.',
+        title: 'Forget download history, so completed posts can be listed again.',
         onClick: () => callbacks.onResetHistory(),
       }),
       h('button', { class: 'psTextButton danger', type: 'button', text: 'Clear list', onClick: () => callbacks.onClearList() }),
@@ -185,8 +190,8 @@ function queueRow(row: QueueRowView, state: QueueListState, callbacks: QueueList
       type: 'checkbox',
       class: 'psRowCheck',
       checked: row.selected,
-      disabled: finished || item.status === 'running' || item.status === 'canceled',
-      title: finished ? 'Already downloaded' : 'Include this post in the next download run',
+      disabled: item.status !== 'pending',
+      title: finished ? 'Previously completed' : 'Include this post in the next download run',
       on: { change: () => callbacks.onToggleRow(item.id) },
     }),
   );
@@ -239,14 +244,19 @@ function queueRow(row: QueueRowView, state: QueueListState, callbacks: QueueList
     if (row.server) title.appendChild(h('span', { class: 'psTypeBadge server', text: row.server.siteType }));
   }
   if (row.savedFilename) {
-    title.appendChild(h('span', { class: 'psTypeBadge saved', text: 'saved', title: `Already downloaded as ${row.savedFilename}` }));
+    title.appendChild(h('span', { class: 'psTypeBadge saved', text: 'completed', title: `Chrome reported complete: ${row.savedFilename}` }));
   }
   info.appendChild(title);
 
   const meta = h('div', { class: 'psItemMeta' });
   const file = item.filename ?? row.savedFilename;
   if (file) meta.appendChild(h('span', { class: 'psFile', text: file, title: file }));
-  if (item.bytes !== null) meta.appendChild(h('span', { text: formatBytes(item.bytes) }));
+  if (item.status === 'running' && item.bytesReceived != null) {
+    const total = item.totalBytes != null && item.totalBytes > 0 ? ` / ${formatBytes(item.totalBytes)}` : '';
+    meta.appendChild(h('span', { text: `${formatBytes(item.bytesReceived)}${total} received` }));
+  } else if (item.bytes !== null) {
+    meta.appendChild(h('span', { text: formatBytes(item.bytes) }));
+  }
   if (item.attempts > 1) meta.appendChild(h('span', { text: `attempt ${item.attempts}` }));
   if (item.status === 'done' || item.status === 'failed') meta.appendChild(h('span', { text: relativeTime(item.updatedAt) }));
   info.appendChild(meta);
@@ -259,9 +269,10 @@ function queueRow(row: QueueRowView, state: QueueListState, callbacks: QueueList
   element.appendChild(info);
 
   const right = h('div', { class: 'psItemRight' });
-  right.appendChild(h('span', { class: `psItemStatus ${item.status}`, text: statusLabel(item.status) }));
-  if (item.status === 'running' || item.status === 'pending') {
-    right.appendChild(h('div', { class: 'psItemProgress' }, h('i', { style: `width: ${item.status === 'running' ? '45%' : '0%'}` })));
+  right.appendChild(h('span', { class: `psItemStatus ${item.status}`, text: item.status === 'running' && item.cancelRequested ? 'canceling' : statusLabel(item.status) }));
+  if (item.status === 'running' && item.bytesReceived != null && item.totalBytes != null && item.totalBytes > 0) {
+    const percent = Math.max(0, Math.min(100, Math.round((item.bytesReceived / item.totalBytes) * 100)));
+    right.appendChild(h('div', { class: 'psItemProgress', title: `${percent}% received` }, h('i', { style: `width: ${percent}%` })));
   }
   const actions = h('div', { class: 'psItemActions' });
   if (item.status === 'pending' || item.status === 'running') {
@@ -270,8 +281,9 @@ function queueRow(row: QueueRowView, state: QueueListState, callbacks: QueueList
         class: 'psRowButton',
         type: 'button',
         text: '✕',
-        title: 'Cancel this download',
+        title: item.cancelRequested ? 'Cancellation requested' : 'Cancel this download',
         ariaLabel: 'Cancel this download',
+        disabled: !!item.cancelRequested,
         onClick: () => callbacks.onCancelRow(item.id),
       }),
     );
@@ -299,19 +311,22 @@ function statusLabel(status: QueueItem['status']): string {
     running: 'downloading',
     done: 'completed',
     failed: 'failed',
+    unverified: 'unverified',
     skipped: 'skipped',
     canceled: 'canceled',
   };
   return labels[status];
 }
 
-/** Dock-level controls: concurrency, quality, run/stop. */
+/** Dock-level controls: start workers, original-only quality, run/stop. */
 export interface DockState {
   concurrency: number;
-  filePreference: 'original' | 'sample';
   selectedCount: number;
   pendingCount: number;
+  /** At least one start worker or Chrome transfer is active. */
   running: boolean;
+  /** Workers are currently preparing/starting the selected rows. */
+  dispatching: boolean;
   paused: boolean;
   notice: { text: string; tone: 'plain' | 'ok' | 'error' } | null;
   busy: boolean;
@@ -319,7 +334,6 @@ export interface DockState {
 
 export interface DockCallbacks {
   onConcurrencyChange(value: number): void;
-  onFilePreferenceChange(value: 'original' | 'sample'): void;
   onDownloadSelected(): void;
   onStart(): void;
   onPause(): void;
@@ -333,16 +347,16 @@ export function renderDock(container: HTMLElement, state: DockState, callbacks: 
 
   const controls = h('div', { class: 'psDockControls' });
 
-  const concurrency = h('div', { class: 'psConcurrency', title: 'Maximum active downloads. The remaining selected posts stay safely queued.' });
-  concurrency.appendChild(h('span', { text: 'Downloads at once' }));
-  const segmented = h('div', { class: 'psSegmented', attrs: { role: 'group', 'aria-label': 'Maximum concurrent downloads' } });
+  const concurrency = h('div', { class: 'psConcurrency', title: 'Queue workers prepare download starts; active Chrome transfers are not capped.' });
+  concurrency.appendChild(h('span', { text: 'Start workers' }));
+  const segmented = h('div', { class: 'psSegmented', attrs: { role: 'group', 'aria-label': 'Queue start workers' } });
   for (const value of [1, 2, 3, 5]) {
     segmented.appendChild(
       h('button', {
         type: 'button',
         text: String(value),
         class: value === state.concurrency ? 'selected' : '',
-        title: value === 3 ? 'Recommended default' : `${value} parallel download(s)`,
+        title: value === 3 ? 'Recommended default' : `${value} queue start worker(s)`,
         onClick: () => callbacks.onConcurrencyChange(value),
       }),
     );
@@ -350,29 +364,23 @@ export function renderDock(container: HTMLElement, state: DockState, callbacks: 
   concurrency.appendChild(segmented);
   controls.appendChild(concurrency);
 
-  const quality = h('label', { class: 'psConcurrency' });
-  quality.appendChild(h('span', { text: 'Quality' }));
-  const select = h('select', {
-    class: 'psSelect psCompact',
-    title: 'Original files are what the site hosts; the sample is a smaller, faster version when the site offers one.',
-    on: { change: (event) => callbacks.onFilePreferenceChange((event.target as HTMLSelectElement).value as 'original' | 'sample') },
-  });
-  select.appendChild(h('option', { value: 'original', text: 'Original', selected: state.filePreference === 'original' }));
-  select.appendChild(h('option', { value: 'sample', text: 'Sample (smaller)', selected: state.filePreference === 'sample' }));
-  quality.appendChild(select);
-  controls.appendChild(quality);
+  controls.appendChild(h('span', {
+    class: 'psMuted',
+    text: 'Originals only',
+    title: 'Samples and previews are never substituted for an unavailable original.',
+  }));
   container.appendChild(controls);
 
   const actions = h('div', { class: 'psDockActions' });
   actions.appendChild(
-    button(state.running ? 'Running…' : `Download selected (${state.selectedCount})`, {
+    button(state.dispatching ? 'Starting…' : `Download selected (${state.selectedCount})`, {
       variant: 'primary',
-      disabled: state.busy || state.running || state.selectedCount === 0,
+      disabled: state.busy || state.dispatching || state.selectedCount === 0,
       title: 'Start only the ticked rows. Everything else stays in the list.',
       onClick: () => callbacks.onDownloadSelected(),
     }),
   );
-  if (state.running) {
+  if (state.running || (state.paused && state.pendingCount > 0)) {
     actions.appendChild(
       button(state.paused ? 'Resume' : 'Pause', {
         variant: 'subtle',
@@ -380,7 +388,8 @@ export function renderDock(container: HTMLElement, state: DockState, callbacks: 
       }),
     );
     actions.appendChild(button('Stop', { variant: 'danger', onClick: () => callbacks.onStop() }));
-  } else if (state.pendingCount > 0) {
+  }
+  if (state.pendingCount > 0 && !state.dispatching && !state.paused) {
     actions.appendChild(
       button(`Start queued (${state.pendingCount})`, {
         variant: 'subtle',

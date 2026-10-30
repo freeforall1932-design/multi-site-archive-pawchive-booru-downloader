@@ -14,6 +14,7 @@
  * The card never talks to a site and never touches storage: every action goes
  * through a `UiRequest` handled by the background worker.
  */
+import { manualMirrorProvider } from '../core/links.js';
 import type { MirrorLink, MirrorLinkFilter, MirrorLinkStats, ServerConfigView, TaskRun, TaskView } from '../shared/types.js';
 import { formatBytes, relativeTime } from '../shared/util.js';
 import { button, h } from './dom.js';
@@ -39,7 +40,7 @@ export interface LinksState {
   servers: ServerConfigView[];
   serverId: string | null;
   query: string;
-  /** True when the selected profile is a creator archive (Kemono family). */
+  /** True when the selected profile is a Pawchive. */
   canCollect: boolean;
   busy: boolean;
   progress: { done: number; total: number; label: string } | null;
@@ -86,16 +87,17 @@ export interface LinksCallbacks {
 const STATUS_LABELS: Record<MirrorLink['status'], string> = {
   new: 'not downloaded',
   queued: 'in the queue',
-  done: 'downloaded',
+  done: 'completed',
   failed: 'failed',
+  unverified: 'unverified',
 };
 
 const COMPLETION_LABELS: Record<TaskView['completion'], string> = {
   empty: 'no files yet',
   idle: 'ready',
   'in-progress': 'downloading',
-  complete: 'complete',
-  partial: 'partial - some files failed',
+  complete: 'all completed',
+  partial: 'partial',
   failed: 'failed',
 };
 
@@ -116,7 +118,7 @@ export function renderLinksCard(container: HTMLElement, state: LinksState, callb
       h('h2', { text: 'Mirror links' }),
       h('span', {
         class: 'psMuted psSmall',
-        text: 'Collects the off-site download links inside a creator’s posts (Drive, Mega, MediaFire, …) as one task per creator, and keeps them until you export the package or download it.',
+        text: 'Collects off-site links inside a creator’s posts. Direct file URLs can be queued; Mega and other share pages must be opened or exported for a provider downloader.',
       }),
     ),
   );
@@ -126,12 +128,12 @@ export function renderLinksCard(container: HTMLElement, state: LinksState, callb
   serverRow.appendChild(h('span', { class: 'psMuted psSmall', text: 'Profile' }));
   const select = h('select', {
     class: 'psSelect',
-    title: 'Which saved profile the links are collected with. Creator archives only - the mirror links live in their post bodies.',
+    title: 'Which saved profile the links are collected with. Pawchive only - the mirror links live in its post bodies.',
     on: {
       change: (event) => callbacks.onServerChange((event.target as HTMLSelectElement).value),
     },
   });
-  if (!state.servers.length) select.appendChild(h('option', { value: '', text: 'No profile saved yet' }));
+  if (!state.servers.length) select.appendChild(h('option', { value: '', text: 'No Pawchive profile saved yet' }));
   for (const entry of state.servers) {
     select.appendChild(
       h('option', {
@@ -145,7 +147,7 @@ export function renderLinksCard(container: HTMLElement, state: LinksState, callb
   serverRow.appendChild(
     h('span', {
       class: 'psMuted psSmall',
-      text: state.canCollect ? 'archive API' : 'pick a Kemono/Pawchive/Coomer profile',
+      text: state.canCollect ? 'archive API' : 'add a Pawchive profile',
     }),
   );
   container.appendChild(serverRow);
@@ -179,7 +181,7 @@ export function renderLinksCard(container: HTMLElement, state: LinksState, callb
   container.appendChild(
     h('p', {
       class: 'psHint',
-      text: 'Collecting a creator you already have updates that task: new posts are added, files that failed are retried by Download missing, and files you already saved are left alone.',
+      text: 'Rescanning updates this task. Confirmed completions are skipped; older starts are unverified. Chrome completion does not verify file contents.',
     }),
   );
 
@@ -252,10 +254,15 @@ export function renderLinksCard(container: HTMLElement, state: LinksState, callb
       { class: 'psSummary' },
       summaryTile(state.stats.total, 'collected'),
       summaryTile(state.stats.new, 'to download'),
-      summaryTile(state.stats.done, 'downloaded'),
+      summaryTile(state.stats.done, 'completed'),
       summaryTile(state.stats.failed, 'failed'),
+      summaryTile(state.stats.unverified, 'unverified'),
     ),
   );
+
+  if (state.stats.unverified) {
+    container.appendChild(h('p', { class: 'psHint warn', text: `${state.stats.unverified} older or missing download record(s) are unverified. Check Chrome Downloads before retrying.` }));
+  }
 
   // ------------------------------------------------------------------- tasks
   if (state.tasks.length) {
@@ -342,7 +349,7 @@ export function renderLinksCard(container: HTMLElement, state: LinksState, callb
         h('button', {
           class: 'psTextButton',
           type: 'button',
-          text: `Clear downloaded (${state.stats.done})`,
+          text: `Clear completed (${state.stats.done})`,
           disabled: state.stats.done === 0,
           onClick: () => callbacks.onClear('done'),
         }),
@@ -392,7 +399,7 @@ export function renderLinksCard(container: HTMLElement, state: LinksState, callb
           class: 'psMuted',
           text: state.busy
             ? 'Scanning… links appear here as they are found.'
-            : 'Pick a Kemono/Coomer/Pawchive profile, paste the creator, then press Collect links - or open a package someone sent you with Import package.',
+            : 'Pick a Pawchive profile, paste the creator, then press Collect links - or open a package someone sent you with Import package.',
         }),
       ),
     );
@@ -425,8 +432,9 @@ function taskCard(card: TaskCardView, callbacks: LinksCallbacks): HTMLElement {
   head.appendChild(title);
 
   const meta = h('div', { class: 'psItemMeta' });
-  meta.appendChild(h('span', { class: 'psMuted psSmall', text: `${stats.done}/${stats.total} file(s) saved` }));
+  meta.appendChild(h('span', { class: 'psMuted psSmall', text: `${stats.done}/${stats.total} file(s) completed` }));
   if (stats.failed) meta.appendChild(h('span', { class: 'psMuted psSmall', text: `${stats.failed} failed` }));
+  if (stats.unverified) meta.appendChild(h('span', { class: 'psMuted psSmall', text: `${stats.unverified} unverified` }));
   if (stats.pending) meta.appendChild(h('span', { class: 'psMuted psSmall', text: `${stats.pending} still missing` }));
   if (stats.bytes !== null) meta.appendChild(h('span', { class: 'psMuted psSmall', text: formatBytes(stats.bytes) }));
   if (task.lastScanAt) meta.appendChild(h('span', { class: 'psMuted psSmall', text: `scanned ${relativeTime(task.lastScanAt)}` }));
@@ -442,7 +450,7 @@ function taskCard(card: TaskCardView, callbacks: LinksCallbacks): HTMLElement {
       variant: 'subtle',
       disabled: missing === 0,
       title:
-        'Queue every file of this task that is not saved yet - new files and earlier failures. Files already downloaded are never fetched twice.',
+        'Queue uncompleted links, including failures and unverified starts. Provider share pages still need to be opened or exported.',
       onClick: () => callbacks.onTaskStart(task.id, 'missing'),
     }),
   );
@@ -503,7 +511,10 @@ function runLabel(run: TaskRun): string {
   if (run.scannedPosts) bits.push(`${run.scannedPosts} post(s) scanned`);
   if (run.added) bits.push(`${run.added} new file(s)`);
   if (run.queued) bits.push(`${run.queued} queued`);
-  if (run.done || run.failed) bits.push(`${run.done} saved · ${run.failed} failed`);
+  if (run.done || run.failed) {
+    const completed = run.completionTracking === 'browser-complete' ? 'completed' : 'starts (unverified)';
+    bits.push(`${run.done} ${completed} · ${run.failed} failed`);
+  }
   if (!run.finishedAt) bits.push('still running');
   return bits.join(' · ');
 }
@@ -532,9 +543,12 @@ function linkRow(row: MirrorLinkRow, callbacks: LinksCallbacks): HTMLElement {
   const info = h('div', { class: 'psItemInfo' });
   const title = h('div', { class: 'psItemTitle' });
   title.appendChild(h('span', { class: 'psTypeBadge server', text: link.provider }));
+  if (manualMirrorProvider(link.url)) {
+    title.appendChild(h('span', { class: 'psTypeBadge', text: 'open/export', title: 'This share page needs its provider’s downloader.' }));
+  }
   if (link.postTitle) title.appendChild(h('span', { class: 'psMuted psSmall psTruncate', text: link.postTitle, title: link.postTitle }));
   if (link.status === 'done' && link.filename) {
-    title.appendChild(h('span', { class: 'psTypeBadge saved', text: 'saved', title: `Saved as ${link.filename}` }));
+    title.appendChild(h('span', { class: 'psTypeBadge saved', text: 'completed', title: `Chrome reported complete: ${link.filename}` }));
   }
   info.appendChild(title);
 
