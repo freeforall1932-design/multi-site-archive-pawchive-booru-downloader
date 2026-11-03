@@ -30,9 +30,7 @@ export const KNOWN_SITE_TYPES = [
   'ponybooru',
   // Local client
   'hydrus',
-  // Creator archives
-  'kemono',
-  'coomer',
+  // Creator archive
   'pawchive',
 ] as const;
 export type KnownSiteType = (typeof KNOWN_SITE_TYPES)[number];
@@ -198,6 +196,8 @@ export interface BooruPost {
   parentId: string | null;
   hasChildren: boolean;
   description: string | null;
+  /** Pawchive can supply an expiring link or only a reduced preview. */
+  fileAvailability?: 'full' | 'temporary' | 'preview';
 }
 
 export interface SearchSpec {
@@ -219,6 +219,8 @@ export interface SearchSpec {
 
 export interface SearchResult {
   posts: BooruPost[];
+  /** Original post references, including posts without downloadable files. */
+  sourcePosts?: Array<{ id: string; label: string; postUrl: string }>;
   page: number;
   limit: number;
   hasMore: boolean;
@@ -268,7 +270,7 @@ export type MirrorLinkFilter = 'downloads' | 'any';
 /** Where a collected mirror link's file is put, relative to the download root. */
 export const DEFAULT_MIRROR_FOLDER = 'mirrors/{host}';
 
-export type MirrorLinkStatus = 'new' | 'queued' | 'done' | 'failed';
+export type MirrorLinkStatus = 'new' | 'queued' | 'done' | 'failed' | 'unverified';
 
 /**
  * One off-site download link found inside a post (Google Drive, Mega, …).
@@ -294,6 +296,8 @@ export interface MirrorLink {
   creator: string | null;
   addedAt: string;
   status: MirrorLinkStatus;
+  /** Only set when Chrome reported this transfer complete. */
+  completion?: 'browser-complete';
   attempts: number;
   error: string | null;
   filename: string | null;
@@ -307,6 +311,7 @@ export interface MirrorLinkStats {
   queued: number;
   done: number;
   failed: number;
+  unverified: number;
 }
 
 /**
@@ -334,6 +339,8 @@ export interface TaskRun {
   done: number;
   failed: number;
   note: string | null;
+  /** Older runs counted starts rather than browser-confirmed completions. */
+  completionTracking?: 'browser-complete';
 }
 
 /**
@@ -373,7 +380,8 @@ export interface TaskStats {
   done: number;
   failed: number;
   queued: number;
-  /** Files not downloaded yet (new + queued). */
+  unverified: number;
+  /** Files not confirmed complete (new, queued, failed or unverified). */
   pending: number;
   /** Bytes of the files that finished (null when none reported a size). */
   bytes: number | null;
@@ -412,7 +420,7 @@ export type MediaFilter = 'all' | 'video' | 'image';
 /** What to do when the browser reports an existing file with the same name. */
 export type DuplicateBehaviour = 'uniquify' | 'overwrite';
 
-/** Original file, or the site's smaller "sample" rendition when it has one. */
+/** `sample` is accepted only for legacy imports and migrates to `original`. */
 export type FilePreference = 'original' | 'sample';
 
 export interface ExtensionSettings {
@@ -462,7 +470,7 @@ export interface ExtensionSettings {
   autoStartQueue: boolean;
   /** Existing file with the same name: keep both or overwrite. */
   duplicateBehaviour: DuplicateBehaviour;
-  /** Download the full file or the smaller sample the site offers. */
+  /** Legacy setting: always normalized to original for downloads. */
   filePreference: FilePreference;
   /** Space/comma separated tags excluded from every search (`-tag`). */
   tagBlacklist: string;
@@ -501,7 +509,8 @@ export const DEFAULT_SETTINGS: ExtensionSettings = {
   uiMode: 'sidepanel',
   panelDefaultTab: 'browse',
   mediaFilter: 'all',
-  skipDownloaded: true,
+  // Opt in to hiding browser-confirmed completions; files may later be moved or deleted.
+  skipDownloaded: false,
   pageRangeLimit: 150,
   queueRowLimit: 60,
   showThumbnails: true,
@@ -517,7 +526,7 @@ export const DEFAULT_SETTINGS: ExtensionSettings = {
   mirrorLinksFilter: 'downloads',
 };
 
-/** Result of a successful download, kept so listings can skip it next time. */
+/** A browser download start, kept so listings can optionally skip it next time. */
 export interface DownloadHistoryEntry {
   /** `${serverId}:${postId}` - the uniqueness key. */
   key: string;
@@ -529,6 +538,10 @@ export interface DownloadHistoryEntry {
   postUrl: string;
   bytes: number | null;
   at: string;
+  /** Absent on old entries that may have been samples. */
+  quality?: 'original';
+  /** Absent on old entries, which recorded a start rather than completion. */
+  completion?: 'browser-complete';
 }
 
 /** One remembered search, per server (Anime Boxes keeps the same list). */
@@ -538,7 +551,7 @@ export interface SearchHistoryEntry {
   at: string;
 }
 
-export type QueueItemStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped' | 'canceled';
+export type QueueItemStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped' | 'canceled' | 'unverified';
 
 export interface QueueItem {
   id: string;
@@ -556,12 +569,28 @@ export interface QueueItem {
   url?: string | null;
   /** Canonical rating known at enqueue time (null for items queued before v0.2). */
   rating: Rating | null;
+  /** Distinguishes current Pawchive slot numbering from older ambiguous rows. */
+  attachmentIndexVersion?: 2;
+  /** Pawchive API path hash observed at listing time, when supplied. */
+  expectedFileHash?: string | null;
   status: QueueItemStatus;
   attempts: number;
   error: string | null;
   errorKind: FailureKind | null;
   filename: string | null;
   bytes: number | null;
+  /** Durable Chrome ID, absent while a request is still being prepared. */
+  downloadId?: number | null;
+  /** Browser-reported byte progress; null means Chrome did not report a value. */
+  bytesReceived?: number | null;
+  totalBytes?: number | null;
+  cancelRequested?: boolean;
+  /** Distinguishes confirmed completions from the old start-only `done` rows. */
+  completion?: 'browser-complete';
+  /** Details needed to write post history after the browser finishes. */
+  historyEntry?: DownloadHistoryEntry | null;
+  /** A bookkeeping write failed and should be retried without downloading again. */
+  bookkeepingPending?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -573,6 +602,7 @@ export interface QueueSummary {
   failed: number;
   skipped: number;
   canceled: number;
+  unverified: number;
   total: number;
   paused: boolean;
   active: boolean;

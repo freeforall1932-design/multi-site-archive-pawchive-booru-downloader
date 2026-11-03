@@ -43,7 +43,8 @@ function mount(route: RouteMatch & { server: ServerConfigView | null }): void {
 
   const button = document.createElement('button');
   button.type = 'button';
-  button.textContent = `⬇ Download with Booru Manager`;
+  button.textContent = route.siteType === 'pawchive' ? '⬇ Download first file' : '⬇ Download with Booru Manager';
+  if (route.siteType === 'pawchive') button.title = 'For every attachment, open the side panel and choose Add all available files.';
 
   const status = document.createElement('div');
   status.className = 'status';
@@ -52,17 +53,28 @@ function mount(route: RouteMatch & { server: ServerConfigView | null }): void {
   button.addEventListener('click', async () => {
     button.disabled = true;
     button.textContent = 'Downloading…';
-    const response = (await globalThis.chrome.runtime.sendMessage({
-      type: 'posts/download',
-      payload: { serverId: route.server?.id ?? null, url: location.href },
-    } satisfies UiRequest)) as { ok: boolean; data?: { filename: string }; error?: { message: string; hint?: string | null } };
-    button.disabled = false;
-    if (response?.ok) {
-      button.textContent = '⬇ Download again';
-      showStatus(`Saved as ${response.data?.filename ?? 'file'}`);
-    } else {
-      button.textContent = '⬇ Retry download';
-      showStatus(`${response?.error?.message ?? 'Download failed'}${response?.error?.hint ? ` - ${response.error.hint}` : ''}`);
+    try {
+      const response = (await globalThis.chrome.runtime.sendMessage({
+        type: 'posts/download',
+        payload: { serverId: route.server?.id ?? null, url: location.href },
+      } satisfies UiRequest)) as { ok: boolean; data?: { filename: string; post?: { fileAvailability?: string } }; error?: { message: string; hint?: string | null } } | undefined;
+      if (response?.ok) {
+        button.textContent = '⬇ Download again';
+        showStatus(`Started original file: ${response.data?.filename ?? 'file'}. Check browser Downloads for completion.`);
+      } else if (response) {
+        button.textContent = '⬇ Retry download';
+        showStatus(`${response.error?.message ?? 'Download failed'}${response.error?.hint ? ` - ${response.error.hint}` : ''}`);
+      } else {
+        button.textContent = '⬇ Check download';
+        showStatus('No response from the extension. Check the queue and Chrome Downloads before trying again.');
+      }
+    } catch {
+      // A closed message channel may occur after Chrome started the transfer.
+      // Do not replay it automatically or claim it failed.
+      button.textContent = '⬇ Check download';
+      showStatus('The extension did not confirm the request. Check the queue and Chrome Downloads before trying again.');
+    } finally {
+      button.disabled = false;
     }
   });
 

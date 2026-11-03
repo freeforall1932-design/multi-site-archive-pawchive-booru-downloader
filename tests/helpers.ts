@@ -11,7 +11,7 @@ import { createRouter } from '../src/core/router.js';
 import { ValidationService } from '../src/core/validation.js';
 import { HttpClient } from '../src/shared/http.js';
 import { DEFAULT_SETTINGS, type ExtensionSettings, type ServerConfig } from '../src/shared/types.js';
-import type { HttpResponseSnapshot } from '../src/shared/http.js';
+import type { FetchLike, HttpResponseSnapshot } from '../src/shared/http.js';
 import { RecordingDownloader } from '../src/core/downloads.js';
 import { createServerConfig } from '../src/core/servers.js';
 import { createMockBooruFetch } from '../src/preview/mock-booru.js';
@@ -24,6 +24,7 @@ export interface TestHarnessOptions {
   seedServers?: ServerConfig[];
   /** Use the offline mock booru backend instead of a stubbed fetch. */
   mockBooru?: boolean;
+  fetchImpl?: FetchLike;
 }
 
 /** Wires the whole service graph against in-memory storage. */
@@ -31,7 +32,7 @@ export function createHarness(options: TestHarnessOptions = {}) {
   const area = new MemoryStorageArea();
   const settings = new SettingsStore(area);
   const servers = new ServerStore(area);
-  const fetchImpl = options.mockBooru === false ? undefined : createMockBooruFetch({ latencyMs: 0 });
+  const fetchImpl = options.fetchImpl ?? (options.mockBooru === false ? undefined : createMockBooruFetch({ latencyMs: 0 }));
   const http = new HttpClient({ fetchImpl, maxRetries: 2, retryBaseDelayMs: 1, sleepImpl: async () => undefined });
   const validation = new ValidationService(http);
   const client = new BooruClient({ servers, settings, http, validation });

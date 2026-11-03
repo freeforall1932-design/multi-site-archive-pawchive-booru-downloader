@@ -4,6 +4,7 @@
  */
 import { registerBuiltinAdapters } from '../adapters/index.js';
 import type { UiRequest } from '../core/messages.js';
+import { isUsableServer } from '../core/servers.js';
 import { getPlatform, isExtensionEnvironment } from '../platform/index.js';
 import type {
   BooruPost,
@@ -14,6 +15,7 @@ import type {
 } from '../shared/types.js';
 import { button, clear, h } from '../ui/dom.js';
 import { ratingChip, siteTypeChip, validationDot } from '../ui/format.js';
+import { postImage } from '../ui/post-image.js';
 import { showError, toast } from '../ui/toast.js';
 
 const platform = getPlatform();
@@ -40,7 +42,7 @@ const state: PopupState = {
   results: null,
   tags: '',
   busy: false,
-  summary: { pending: 0, running: 0, done: 0, failed: 0, skipped: 0, canceled: 0, total: 0, paused: false, active: false },
+  summary: { pending: 0, running: 0, done: 0, failed: 0, skipped: 0, canceled: 0, unverified: 0, total: 0, paused: false, active: false },
 };
 
 async function send<T>(request: UiRequest): Promise<T | null> {
@@ -168,7 +170,7 @@ function render(): void {
       h(
         'div',
         { class: 'popup-row' },
-        button('Start', { variant: 'subtle', iconName: 'play', disabled: state.summary.running > 0 || state.summary.pending === 0, onClick: () => void runQueue() }),
+        button('Start', { variant: 'subtle', iconName: 'play', disabled: state.summary.active || state.summary.pending === 0, onClick: () => void runQueue() }),
         button('Queue', { variant: 'subtle', onClick: () => platform.openOptions('queue') }),
       ),
     ),
@@ -215,11 +217,12 @@ function renderPageCard(server: ServerConfigView | null): HTMLElement {
         ? h(
             'div',
             { class: 'popup-post' },
-            h('img', { src: post.previewUrl, alt: `post ${post.id}` }),
+            postImage(post, { alt: `post ${post.id}` }),
             h(
               'div',
               {},
-              h('div', { class: 'popup-row' }, h('strong', { text: `#${post.id}` }), ratingChip(post.rating)),
+              h('div', { class: 'popup-row' }, h('strong', { text: `#${post.id}` }), ratingChip(post.rating),
+                post.fileAvailability === 'preview' ? h('span', { class: 'chip chip-soft', text: 'preview only' }) : null),
               h('div', { class: 'muted small', text: `${post.ext ?? '?'} · ${post.width ?? '?'}×${post.height ?? '?'}` }),
               h('div', { class: 'muted small truncate', text: post.tags.slice(0, 5).join(' ') }),
               h(
@@ -231,7 +234,9 @@ function renderPageCard(server: ServerConfigView | null): HTMLElement {
             ),
           )
         : h('p', { class: 'muted small', text: 'Loading post…' }),
-    post ? h('div', { class: 'popup-row' }, h('a', { class: 'link small', href: post.postUrl, target: '_blank', rel: 'noreferrer', text: 'Open post page' })) : null,
+    post ? h('div', { class: 'popup-row' }, post.siteType === 'hydrus'
+      ? h('span', { class: 'muted small', text: 'Open this file in the Hydrus client.' })
+      : h('a', { class: 'link small', href: post.postUrl, target: '_blank', rel: 'noreferrer', text: 'Open post page' })) : null,
     server ? h('span', { class: 'muted small', text: `via ${server.label}` }) : null,
   );
 }
@@ -240,13 +245,13 @@ function postTile(post: BooruPost): HTMLElement {
   return h(
     'figure',
     {},
-    h('img', {
-      src: post.previewUrl,
+    postImage(post, {
       alt: `post ${post.id}`,
-      title: `${post.tags.slice(0, 8).join(' ')}`,
+      title: post.siteType === 'hydrus' ? 'Open this file in the Hydrus client' : `${post.tags.slice(0, 8).join(' ')}`,
       loading: 'lazy',
-      on: { click: () => globalThis.open(post.postUrl, '_blank', 'noopener') },
+      on: { click: () => { if (post.siteType !== 'hydrus') globalThis.open(post.postUrl, '_blank', 'noopener'); } },
     }),
+    post.fileAvailability === 'preview' ? h('figcaption', { class: 'small', text: 'preview only' }) : null,
     h('div', { class: 'popup-grid-actions' }, button('↓', { title: 'Download', onClick: () => void downloadPost(post) }), button('+', { title: 'Add to queue', onClick: () => void queuePost(post) })),
   );
 }
@@ -256,7 +261,7 @@ function postTile(post: BooruPost): HTMLElement {
 async function makeDefault(id: string): Promise<void> {
   const servers = await send<ServerConfigView[]>({ type: 'servers/setDefault', payload: { id } });
   if (servers) {
-    state.servers = servers;
+    state.servers = servers.filter(isUsableServer);
     state.activeServerId = id;
     toast('Default server updated', 'success');
     render();
@@ -264,14 +269,16 @@ async function makeDefault(id: string): Promise<void> {
 }
 
 async function downloadPost(post: BooruPost): Promise<void> {
-  const result = await send<{ filename: string }>({ type: 'posts/download', payload: { serverId: post.serverId, postId: post.id } });
-  if (result) toast(`Saving ${result.filename}`, 'success');
+  const result = await send<{ filename: string; post: BooruPost }>({ type: 'posts/download', payload: { serverId: post.serverId, postId: post.id } });
+  if (result) {
+    toast(`Started original file download: ${result.filename}`, 'success');
+  }
 }
 
 async function queuePost(post: BooruPost): Promise<void> {
   const result = await send<{ added: number; skipped: number; summary: QueueSummary }>({
     type: 'queue/enqueuePosts',
-    payload: { serverId: post.serverId, posts: [{ id: post.id, label: `${post.siteType} #${post.id}`, postUrl: post.postUrl, rating: post.rating }] },
+    payload: { serverId: post.serverId, posts: [{ id: post.id, label: `${post.siteType} #${post.id}${post.fileAvailability === 'preview' ? ' [preview only]' : ''}`, postUrl: post.postUrl, rating: post.rating, expectedFileHash: post.siteType === 'pawchive' ? post.md5 : null }] },
   });
   if (result) {
     state.summary = result.summary;
@@ -287,7 +294,7 @@ async function queueAll(): Promise<void> {
     type: 'queue/enqueuePosts',
     payload: {
       serverId: server.id,
-      posts: state.results.posts.map((post) => ({ id: post.id, label: `${post.siteType} #${post.id}`, postUrl: post.postUrl, rating: post.rating })),
+      posts: state.results.posts.map((post) => ({ id: post.id, label: `${post.siteType} #${post.id}${post.fileAvailability === 'preview' ? ' [preview only]' : ''}`, postUrl: post.postUrl, rating: post.rating, expectedFileHash: post.siteType === 'pawchive' ? post.md5 : null })),
     },
   });
   if (result) {
@@ -343,7 +350,7 @@ async function boot(): Promise<void> {
     platform.activeTabUrl(),
     send<{ summary: QueueSummary }>({ type: 'queue/list' }),
   ]);
-  state.servers = servers ?? [];
+  state.servers = (servers ?? []).filter(isUsableServer);
   state.summary = queue?.summary ?? state.summary;
   state.activeServerId = state.servers.find((server) => server.isDefault)?.id ?? state.servers[0]?.id ?? null;
 

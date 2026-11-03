@@ -6,7 +6,7 @@
  * Usage: npm run preview   (builds first, then serves on 0.0.0.0:4173)
  */
 import { createServer } from 'node:http';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 const root = process.cwd();
@@ -83,24 +83,40 @@ const server = createServer(async (req, res) => {
       pathname = '/dev/preview/index.html';
     }
 
+    // Only the compiled extension and the harness are public. In particular,
+    // never serve source files, Git metadata or sibling directories. Normalize
+    // first so encoded traversal cannot pass the prefix check.
+    pathname = path.posix.normalize(pathname);
+    const area = pathname.startsWith('/dist/') ? 'dist'
+      : pathname.startsWith('/dev/preview/') ? 'dev/preview' : null;
+    if (!area) {
+      res.writeHead(404, { 'content-type': 'text/plain' }).end('not found');
+      return;
+    }
+    const allowedRoot = path.join(root, area);
     const candidate = path.join(root, pathname.replace(/^\/+/, ''));
-    const normalized = path.normalize(candidate);
-    if (!normalized.startsWith(root)) {
-      res.writeHead(403).end('forbidden');
+    const info = await stat(candidate).catch(() => null);
+    if (!info || !info.isFile()) {
+      res.writeHead(404, { 'content-type': 'text/plain' }).end('not found');
       return;
     }
-    const info = await stat(normalized).catch(() => null);
-    if (!info || info.isDirectory()) {
-      res.writeHead(404, { 'content-type': 'text/plain' }).end(`Not found: ${pathname}`);
+    // realpath also blocks symlinks inside an allowed directory that point out.
+    const [realRoot, realCandidate] = await Promise.all([realpath(allowedRoot), realpath(candidate)]);
+    const relative = path.relative(realRoot, realCandidate);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      res.writeHead(403, { 'content-type': 'text/plain' }).end('forbidden');
       return;
     }
-    await sendFile(res, normalized);
+    await sendFile(res, realCandidate);
   } catch (error) {
-    res.writeHead(500, { 'content-type': 'text/plain' }).end(String(error));
+    const status = error instanceof URIError ? 400 : 500;
+    res.writeHead(status, { 'content-type': 'text/plain' }).end(status === 400 ? 'bad request' : 'preview server error');
   }
 });
 
 server.listen(port, '0.0.0.0', () => {
-  console.log(`Preview harness:  http://0.0.0.0:${port}/  (options page: /dist/options/options.html)`);
+  const address = server.address();
+  const listeningPort = address && typeof address !== 'string' ? address.port : port;
+  console.log(`Preview harness:  http://0.0.0.0:${listeningPort}/  (options page: /dist/options/options.html)`);
   console.log('Mock booru API + mock media are served by the in-page mock fetch, no real network calls happen.');
 });

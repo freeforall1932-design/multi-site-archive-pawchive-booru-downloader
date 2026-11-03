@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Booru Server Manager",
   "version": "0.2.0",
-  "description": "Side panel downloader for many saved booru servers: manage e621, Danbooru, Gelbooru-family, Moebooru, Philomena, Hydrus and Kemono accounts, list results, review and batch-download.",
+  "description": "Side panel downloader for Pawchive and many saved booru servers: manage profiles, list results, review and batch-download.",
   "minimum_chrome_version": "116",
   "permissions": [
     "storage",
@@ -36,12 +36,10 @@
     "https://derpicdn.net/*",
     "https://furbooru.org/*",
     "https://ponybooru.org/*",
-    "https://kemono.cr/*",
-    "https://*.kemono.cr/*",
-    "https://coomer.st/*",
-    "https://*.coomer.st/*",
     "https://pawchive.pw/*",
-    "https://*.pawchive.pw/*"
+    "https://*.pawchive.pw/*",
+    "https://pawchive.st/*",
+    "https://*.pawchive.st/*"
   ],
   "optional_host_permissions": [
     "https://*/*",
@@ -92,9 +90,10 @@
         "https://derpibooru.org/images/*",
         "https://furbooru.org/images/*",
         "https://ponybooru.org/images/*",
-        "https://kemono.cr/*/user/*/post/*",
-        "https://coomer.st/*/user/*/post/*",
-        "https://pawchive.pw/*/user/*/post/*"
+        "https://pawchive.pw/*/user/*/post/*",
+        "https://www.pawchive.pw/*/user/*/post/*",
+        "https://pawchive.st/*/user/*/post/*",
+        "https://www.pawchive.st/*/user/*/post/*"
       ],
       "js": [
         "content/post-button.js"

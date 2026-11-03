@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHarness, danbooruServer, e621Server, gelbooruServer } from '../helpers.js';
 import type { UiRequest } from '../../src/core/messages.js';
 import type { ServerConfigView } from '../../src/shared/types.js';
@@ -198,6 +198,19 @@ describe('router - validation', () => {
     });
     expect(result.ok).toBe(true);
     expect(result.kind).toBe('ok');
+  });
+
+  it('never sends a masked stored key to a different draft endpoint', async () => {
+    const views = await ok<ServerConfigView[]>(harness, { type: 'servers/list' });
+    const stored = await harness.servers.get(views[0]!.id);
+    const validate = vi.spyOn(harness.validation, 'validate');
+    const response = await harness.router({
+      type: 'servers/validateDraft',
+      payload: { server: { ...stored!, baseUrl: 'https://other.example', apiKey: '' } },
+    });
+    // An incomplete configuration must be returned before any request is issued.
+    expect(response.ok ? response.data : response.error).toMatchObject({ kind: 'incomplete-config' });
+    expect(validate).not.toHaveBeenCalled();
   });
 
   it('reports an incomplete draft instead of throwing', async () => {

@@ -699,6 +699,10 @@ input[type='checkbox'] {
   border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
 }
 
+.psQueueItem.psStatus-unverified {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
 .psQueueItem .psRowCheck {
   flex: 0 0 auto;
 }
@@ -821,7 +825,8 @@ input[type='checkbox'] {
   color: var(--danger);
 }
 
-.psItemStatus.running {
+.psItemStatus.running,
+.psItemStatus.unverified {
   color: color-mix(in srgb, var(--accent) 62%, var(--text));
 }
 

@@ -69,7 +69,7 @@ function contextFor(url: URL, init?: RequestInit): RequestContext | null {
     ? 'gelbooru'
     : host.includes('danbooru') || host.includes('donmai')
       ? 'danbooru'
-      : host.includes('pawchive') || host.includes('kemono') || host.includes('coomer')
+      : host.includes('pawchive')
         ? 'creator-archive'
         : 'e621';
   const tags = url.searchParams.get('tags') ?? '';
@@ -217,7 +217,7 @@ function gelbooruPost(seed: MockPostSeed, mediaBase: string) {
 }
 
 /**
- * Creator-archive payloads (Kemono / Coomer / Pawchive).
+ * Pawchive creator-archive payloads.
  *
  * The listing returns one entry per post - the adapter expands the attachments
  * into rows itself - and the single-post route returns the newer
@@ -256,7 +256,7 @@ export function createMockBooruFetch(options: MockBooruOptions = {}): FetchLike 
     if (!ctx) return json({ error: 'unsupported host' }, 400);
     if (
       !['e621.net', 'e926.net', 'danbooru.donmai.us', 'gelbooru.com', 'www.gelbooru.com'].includes(url.host) &&
-      !/^(?:www\.)?(?:pawchive\.pw|pawchive\.st|kemono\.cr|kemono\.su|kemono\.party|coomer\.st|coomer\.su|coomer\.party)$/.test(url.host)
+      !/^(?:www\.)?(?:pawchive\.pw|pawchive\.st)$/.test(url.host)
     ) {
       return json({ error: `mock backend does not know host ${url.host}` }, 404);
     }

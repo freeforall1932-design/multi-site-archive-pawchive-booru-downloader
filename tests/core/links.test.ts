@@ -93,9 +93,9 @@ describe('mirror link rules', () => {
     expect(classifyMirrorLink('ftp://example.com/file.zip', { ownHosts }).ok).toBe(false);
   });
 
-  it('normalises entities, fragments and trailing punctuation', () => {
+  it('normalises entities and preserves share-link fragments', () => {
     const urls = extractUrlsFromHtml('<a href="https://mega.nz/file/x&amp;y#frag">x</a>.');
-    expect(urls).toEqual(['https://mega.nz/file/x&y']);
+    expect(urls).toEqual(['https://mega.nz/file/x&y#frag']);
   });
 });
 
@@ -249,13 +249,13 @@ describe('link queue rows', () => {
   it('downloads a link row without a server or a post lookup', async () => {
     const harness = createHarness({ settings: { minRequestIntervalMs: 0, maxConcurrency: 1, mirrorFolderTemplate: 'mirrors/{host}' } });
     await harness.seed();
-    const added = await harness.queue.enqueueLinks([{ url: 'https://mega.nz/file/a?x=1', label: 'pack.zip' }]);
+    const added = await harness.queue.enqueueLinks([{ url: 'https://catbox.moe/pack.zip?x=1', label: 'pack.zip' }]);
     expect(added).toMatchObject({ added: 1, skipped: 0, invalid: 0 });
     await harness.queue.run();
     const [item] = harness.queue.list();
     expect(item?.status).toBe('done');
-    expect(harness.downloader.log[0]?.url).toBe('https://mega.nz/file/a?x=1');
-    expect(harness.downloader.log[0]?.filename).toContain('mirrors/mega.nz/');
+    expect(harness.downloader.log[0]?.url).toBe('https://catbox.moe/pack.zip?x=1');
+    expect(harness.downloader.log[0]?.filename).toContain('mirrors/catbox.moe/');
   });
 
   it('de-duplicates by URL, not by post id', async () => {
@@ -381,15 +381,16 @@ describe('links router flow', () => {
     expect(imported.queued).toBe(exported.count);
 
     await harness.queue.run();
-    expect(harness.queue.list().every((row) => row.status === 'done')).toBe(true);
-    expect((await harness.links.stats()).done).toBe(exported.count);
+    expect(harness.queue.list().every((row) => row.status === 'failed')).toBe(true);
+    expect(harness.queue.list().every((row) => row.error?.includes('provider downloader'))).toBe(true);
+    expect((await harness.links.stats()).failed).toBe(exported.count);
   });
 
   it('downloads an imported URL even with no profile configured at all', async () => {
     const bare = createHarness({ settings: { minRequestIntervalMs: 0, maxConcurrency: 1 } });
     const imported = await ok<{ queued: number }>(bare, {
       type: 'links/import',
-      payload: { text: 'https://mega.nz/file/a\n', queue: true },
+      payload: { text: 'https://catbox.moe/file.zip\n', queue: true },
     });
     expect(imported.queued).toBe(1);
     await bare.queue.run();
@@ -410,7 +411,7 @@ describe('links router flow', () => {
   it("keeps a failed row's message on the link instead of dropping it", async () => {
     const harness2 = createHarness({ settings: { minRequestIntervalMs: 0, maxConcurrency: 1 } });
     await harness2.seed();
-    const url = 'https://mega.nz/file/broken';
+    const url = 'https://catbox.moe/broken.zip';
     await harness2.links.add(collectMirrorLinks({ content: url }, { postId: 'fanbox/1/9' }, { ownHosts: [] }));
     await ok(harness2, { type: 'links/queue', payload: { ids: [(await harness2.links.byUrl(url))!.id] } });
     harness2.downloader.failNext = new Error('HTTP 403 - the hosting page refused the request');

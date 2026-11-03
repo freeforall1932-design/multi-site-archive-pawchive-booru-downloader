@@ -87,7 +87,7 @@ export function credentialsLookValid(siteType: 'e621' | 'danbooru' | 'gelbooru',
 }
 
 /**
- * Creator archive (Kemono / Coomer / Pawchive) fixture.
+ * Pawchive creator archive fixture.
  *
  * The mirror links live in the post `content` HTML, exactly like the real sites:
  * every downloadable file is on somebody else's host, listed only as a URL. One

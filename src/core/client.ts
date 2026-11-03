@@ -10,12 +10,14 @@ import type {
   ServerConfig,
 } from '../shared/types.js';
 import { DEFAULT_SAFE_RATINGS } from '../shared/types.js';
-import { clamp, unique } from '../shared/util.js';
+import { clamp, safeUrl, unique } from '../shared/util.js';
 import type { BooruAdapter } from './adapter.js';
 import { createAdapterContext, detectRoute, getAdapter, listAdapters, requireAdapter } from './registry.js';
-import type { ServerStore } from './servers.js';
+import { isUsableServer, type ServerStore } from './servers.js';
 import type { SettingsStore } from './settings.js';
 import type { ValidationService } from './validation.js';
+import { requestRateKey } from './request-policy.js';
+import { hydrusAuthHeaders, hydrusFileUrl } from '../adapters/hydrus.js';
 
 export interface BooruClientDeps {
   servers: ServerStore;
@@ -63,7 +65,16 @@ export class BooruClient {
 
   async resolve(explicitId?: string | null): Promise<ResolvedTarget> {
     const server = await this.resolveServer(explicitId);
-    return { server, adapter: requireAdapter(server.siteType) };
+    const adapter = requireAdapter(server.siteType);
+    if (!isUsableServer(server)) {
+      // Preserve site-specific diagnostics where available, but never send
+      // requests from a legacy profile with an invalid or credential-bearing URL.
+      adapter.normalizeBaseUrl?.(server.baseUrl);
+      throw new BooruError('This server URL is invalid or contains embedded credentials.', {
+        kind: 'incomplete-config', hint: 'Edit the profile and remove credentials from its URL.',
+      });
+    }
+    return { server, adapter };
   }
 
   /** Does the route rating filter apply to this post? */
@@ -94,8 +105,9 @@ export class BooruClient {
     };
     const request = adapter.buildSearchRequest(ctx, fullSpec);
     const snapshot = await this.deps.http.request(request, {
-      rateKey: `server:${server.id}`,
+      rateKey: requestRateKey(server),
       minIntervalMs: Math.max(settings.minRequestIntervalMs, adapter.capabilities.minRequestIntervalMs),
+      maxAttempts: settings.maxRetries,
     });
     return adapter.parseSearchResponse(snapshot, fullSpec, ctx);
   }
@@ -106,10 +118,33 @@ export class BooruClient {
     const ctx = createAdapterContext(adapter, server, settings);
     const request = adapter.buildPostRequest(ctx, postId);
     const snapshot = await this.deps.http.request(request, {
-      rateKey: `server:${server.id}`,
+      rateKey: requestRateKey(server),
       minIntervalMs: Math.max(settings.minRequestIntervalMs, adapter.capabilities.minRequestIntervalMs),
+      maxAttempts: settings.maxRetries,
     });
     return adapter.parsePostResponse(snapshot, postId, ctx);
+  }
+
+  /** Fetch only a configured Hydrus thumbnail by ID; callers cannot supply a URL or key. */
+  async getHydrusThumbnail(serverId: string, postId: string): Promise<string> {
+    const { server, adapter } = await this.resolve(serverId);
+    if (server.siteType !== 'hydrus') {
+      throw new BooruError('Authenticated thumbnails are only available for Hydrus profiles.', { kind: 'unsupported-site' });
+    }
+    if (!server.apiKey.trim() || /[\r\n]/.test(server.apiKey)) {
+      throw new BooruError('A valid Hydrus access key is required for thumbnails.', { kind: 'incomplete-config' });
+    }
+    const settings = await this.deps.settings.get();
+    const ctx = createAdapterContext(adapter, server, settings);
+    return this.deps.http.requestImage({
+      url: hydrusFileUrl(ctx.baseUrl, postId, 'thumbnail'),
+      headers: hydrusAuthHeaders(server.apiKey),
+      redirect: 'error', tag: 'hydrus',
+    }, {
+      rateKey: requestRateKey(server),
+      minIntervalMs: Math.max(settings.minRequestIntervalMs, adapter.capabilities.minRequestIntervalMs),
+      maxBytes: 1024 * 1024,
+    });
   }
 
   /**
@@ -127,8 +162,9 @@ export class BooruClient {
     const ctx = createAdapterContext(adapter, server, settings);
     const request = adapter.buildPostRequest(ctx, postId);
     const snapshot = await this.deps.http.request(request, {
-      rateKey: `server:${server.id}`,
+      rateKey: requestRateKey(server),
       minIntervalMs: Math.max(settings.minRequestIntervalMs, adapter.capabilities.minRequestIntervalMs),
+      maxAttempts: settings.maxRetries,
     });
     const failure = adapter.classifyFailure?.(snapshot) ?? null;
     if (failure) {
@@ -141,7 +177,11 @@ export class BooruClient {
     const server = await this.resolveServer(serverId);
     const settings = await this.deps.settings.get();
     const result = await this.deps.validation.validate(server, settings);
-    await this.deps.servers.updateValidation(server.id, result);
+    const updated = await this.deps.servers.updateValidation(server.id, result, server);
+    if (!updated) {
+      return { ...result, ok: false, kind: 'incomplete-config', endpointOk: null, authOk: null, account: null,
+        message: 'The server profile changed or was removed during validation; validate the current profile again.', trace: [] };
+    }
     return result;
   }
 
@@ -156,8 +196,17 @@ export class BooruClient {
     const servers = await this.deps.servers.list();
     const match = detectRoute(url, servers);
     if (!match) return null;
-    const server = match.serverId ? servers.find((entry) => entry.id === match.serverId) ?? null : null;
-    return { ...match, server };
+    let server = match.serverId ? servers.find((entry) => entry.id === match.serverId) ?? null : null;
+    if (!server && match.siteType === 'pawchive') {
+      // `www` and the former domain are aliases of the same creator archive.
+      const host = safeUrl(url)?.hostname.replace(/^www\./, '');
+      const candidates = servers.filter((entry) => entry.siteType === 'pawchive' && isUsableServer(entry));
+      server = candidates.find((entry) => safeUrl(entry.baseUrl)?.hostname === host)
+        ?? candidates.find((entry) => entry.isDefault)
+        ?? candidates[0]
+        ?? null;
+    }
+    return { ...match, ...(server ? { serverId: server.id } : {}), server };
   }
 
   /** Resolve a post referenced by URL (used by the content script + popup). */

@@ -3,6 +3,7 @@ import type { BooruPost, Rating, SearchResult, ServerConfigView } from '../share
 import { failureLabel } from '../shared/errors.js';
 import { button, h } from './dom.js';
 import { ratingChip, siteTypeChip } from './format.js';
+import { postImage } from './post-image.js';
 
 export interface BrowseState {
   servers: ServerConfigView[];
@@ -74,6 +75,7 @@ export function renderBrowse(container: HTMLElement, state: BrowseState, callbac
 
   const tagInput = h('input', {
     class: 'input',
+    id: 'options-browse-tags',
     type: 'search',
     placeholder: 'e.g. cat solo rating:safe  (site tag syntax)',
     value: state.tags,
@@ -183,9 +185,8 @@ function postCard(post: BooruPost, state: BrowseState, callbacks: BrowseCallback
         on: { change: () => callbacks.onToggleSelect(post.id) },
       }),
     ),
-    h('img', {
+    postImage(post, {
       class: 'post-thumb',
-      src: post.previewUrl,
       alt: `${post.siteType} post ${post.id}`,
       loading: 'lazy',
       on: { error: (event) => ((event.target as HTMLImageElement).classList.add('is-broken')) },
@@ -193,7 +194,8 @@ function postCard(post: BooruPost, state: BrowseState, callbacks: BrowseCallback
     h(
       'div',
       { class: 'post-info' },
-      h('div', { class: 'post-title' }, h('strong', { text: `#${post.id}` }), ratingChip(post.rating)),
+      h('div', { class: 'post-title' }, h('strong', { text: `#${post.id}` }), ratingChip(post.rating),
+        post.fileAvailability === 'preview' ? h('span', { class: 'chip chip-soft', text: 'preview only' }) : null),
       h('div', { class: 'muted small', text: `${post.ext ?? '?'} · ${post.width ?? '?'}×${post.height ?? '?'}${post.score !== null ? ` · score ${post.score}` : ''}` }),
       h('div', { class: 'muted small truncate', text: post.tags.slice(0, 6).join(' ') || '(no tags reported)' }),
       siteTypeChip(post.siteType),
@@ -203,7 +205,9 @@ function postCard(post: BooruPost, state: BrowseState, callbacks: BrowseCallback
       { class: 'post-actions' },
       button('Download', { iconName: 'download', onClick: () => callbacks.onDownloadPost(post) }),
       button('Queue', { iconName: 'queue', onClick: () => callbacks.onToggleSelect(post.id) }),
-      h('a', { class: 'link', href: post.postUrl, target: '_blank', rel: 'noreferrer', text: 'Open post' }),
+      post.siteType === 'hydrus'
+        ? h('span', { class: 'muted small', text: 'Open in Hydrus client', title: 'The Hydrus API URL requires authentication.' })
+        : h('a', { class: 'link', href: post.postUrl, target: '_blank', rel: 'noreferrer', text: 'Open post' }),
     ),
   );
 }

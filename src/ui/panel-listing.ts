@@ -292,13 +292,13 @@ export function renderListingCard(container: HTMLElement, state: ListingState, c
       ),
       h(
         'label',
-        { class: 'psCheck', title: 'Posts you already downloaded are not listed again. Reset the history in Settings to bring them back.' },
+        { class: 'psCheck', title: 'Hides originals Chrome reported complete. Older unverified starts are not hidden; this does not verify file contents.' },
         h('input', {
           type: 'checkbox',
           checked: state.skipDownloaded,
           on: { change: (event) => callbacks.onSkipDownloadedChange((event.target as HTMLInputElement).checked) },
         }),
-        h('span', { text: 'Skip downloaded' }),
+        h('span', { text: 'Skip completed downloads' }),
       ),
     ),
   );
@@ -365,7 +365,7 @@ export function renderListingCard(container: HTMLElement, state: ListingState, c
   const summaryBits: string[] = [];
   if (state.listedCount) summaryBits.push(`${state.listedCount} row(s) in the list`);
   if (state.matchedCount !== null && state.matchedCount !== undefined) summaryBits.push(`~${state.matchedCount} match(es) on the site`);
-  if (state.skippedDownloaded) summaryBits.push(`${state.skippedDownloaded} already downloaded, skipped`);
+  if (state.skippedDownloaded) summaryBits.push(`${state.skippedDownloaded} previously completed, skipped`);
   container.appendChild(
     h('p', {
       class: 'psHint',

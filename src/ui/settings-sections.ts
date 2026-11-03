@@ -26,6 +26,8 @@ import { toast } from './toast.js';
 export interface SettingsSectionsState {
   settings: ExtensionSettings;
   saving: boolean;
+  /** The options page uses an explicit draft; the side panel saves edits. */
+  autoSave?: boolean;
   servers: ServerConfigView[];
   adapters: AdapterCatalogEntry[];
   historyCount: number;
@@ -145,7 +147,9 @@ export function renderSettingsSections(
   container.appendChild(
     section(
       'Global behaviour',
-      'Applies to every server unless an adapter requires stricter limits. Changes are stored as you make them; the Save button is a shortcut, not a requirement.',
+      state.autoSave === false
+        ? 'Applies to every server unless an adapter requires stricter limits. Changes here are a draft until you press Save settings.'
+        : 'Applies to every server unless an adapter requires stricter limits. Changes are stored as you make them; Save settings re-applies them.',
     ),
   );
   container.appendChild(
@@ -206,7 +210,7 @@ export function renderSettingsSections(
   );
   container.appendChild(
     row(
-      'Downloads at once',
+      'Queue start workers',
       select(
         String(settings.maxConcurrency) as '1' | '2' | '3' | '5' | '8',
         [
@@ -219,7 +223,7 @@ export function renderSettingsSections(
         (value) => callbacks.onChange({ maxConcurrency: Number(value) }),
         { id: 'psConcurrency' },
       ),
-      'The remaining selected posts stay safely queued. Sites see one download at a time per slot, so higher values mean more parallel connections - watch the "rate-limited" warnings if you raise it.',
+      'Number of workers preparing and starting downloads. Chrome manages transfers after they start, so this does not cap active downloads. Pawchive starts remain spaced apart.',
     ),
   );
   container.appendChild(
@@ -242,7 +246,7 @@ export function renderSettingsSections(
   );
   container.appendChild(
     row(
-      'Retries per download',
+      'API request attempts',
       select(
         String(settings.maxRetries) as never,
         [
@@ -254,7 +258,7 @@ export function renderSettingsSections(
         (value) => callbacks.onChange({ maxRetries: Number(value) }),
         { id: 'psRetries' },
       ),
-      'Transient failures (network glitches, 5xx, "slow down" answers) are retried with backoff. Authentication and missing-configuration errors are never retried - they would fail again.',
+      'Maximum attempts for transient API and validation failures (including the first request). Network errors, 5xx and rate limits use backoff; authentication errors are not retried. Chrome file transfers are not automatically restarted.',
     ),
   );
   container.appendChild(
@@ -368,7 +372,7 @@ export function renderSettingsSections(
   );
   container.appendChild(
     row(
-      'Skip posts already downloaded',
+      'Skip posts previously completed',
       select(
         settings.skipDownloaded ? 'on' : 'off',
         [
@@ -378,7 +382,7 @@ export function renderSettingsSections(
         (value) => callbacks.onChange({ skipDownloaded: value === 'on' }),
         { id: 'psSkipDownloaded' },
       ),
-      'Re-running a search then only lists what you do not have yet. Rows you already saved are shown greyed out with a "saved" badge when the filter is off. Reset the notebook below to list everything again.',
+      'Only original downloads Chrome reported complete are hidden. Older starts and unknown-quality records are ignored. This does not verify file contents or that the file still exists.',
     ),
   );
 
@@ -386,7 +390,7 @@ export function renderSettingsSections(
 
   // ----------------------------------------------------------- 4. search rules
   container.appendChild(
-    section('Search behaviour', 'Extra rules applied to every query, wherever it is typed.'),
+    section('Search behaviour', 'Tag rules apply to booru searches, not Pawchive creator or title queries.'),
   );
   container.appendChild(
     row(
@@ -397,7 +401,7 @@ export function renderSettingsSections(
         'e.g. -scat -gore',
         (value) => callbacks.onChange({ globalTagSuffix: value }),
       ),
-      'Appended to every search (and to queueing from a listing). Use it for site-wide preferences such as an author rating or a language tag.',
+      'Appended to booru searches (and to queueing from a listing). Pawchive searches are not tag-booru queries and do not use this rule.',
     ),
   );
   container.appendChild(
@@ -409,7 +413,7 @@ export function renderSettingsSections(
         'e.g. guro vore scat',
         (value) => callbacks.onChange({ tagBlacklist: value }),
       ),
-      'Space or comma separated. Each tag is excluded with the portable "-tag" syntax that e621, Danbooru and Gelbooru all understand, and duplicates are removed from what you typed yourself.',
+      'Space or comma separated. Each tag is excluded with the portable "-tag" syntax on supported boorus. This blacklist does not filter Pawchive results.',
     ),
   );
   container.appendChild(
@@ -651,10 +655,10 @@ export function renderSettingsSections(
   container.appendChild(
     section(
       'Download history',
-      'Post ids that were downloaded successfully are remembered in this browser, so a search you already ran does not download everything a second time. Nothing is deleted from disk by these buttons.',
+      'Post ids are remembered after Chrome reports an original-file download complete. Older start-only entries remain unverified; no hashes or file contents are checked. These buttons do not delete files.',
     ),
   );
-  container.appendChild(h('div', { class: 'psStatus' }, `${state.historyCount} downloaded post(s) remembered · ${state.searchCount} remembered search(es)`));
+  container.appendChild(h('div', { class: 'psStatus' }, `${state.historyCount} history record(s) retained · ${state.searchCount} remembered search(es)`));
   container.appendChild(
     h(
       'div',
@@ -676,7 +680,9 @@ export function renderSettingsSections(
       'div',
       { class: 'psFooter' },
       button(state.saving ? 'Saving…' : 'Save settings', { variant: 'primary', disabled: state.saving, onClick: () => callbacks.onSave() }),
-      h('small', { class: 'psHint', text: 'Settings are stored as you change them; use this button to re-apply and sync the User-Agent rules in one go.' }),
+      h('small', { class: 'psHint', text: state.autoSave === false
+        ? 'Save this draft and sync the User-Agent rules. Changes made while saving remain in the draft.'
+        : 'Settings are stored as you change them; use this button to re-apply and sync the User-Agent rules in one go.' }),
     ),
   );
 }
@@ -796,5 +802,5 @@ function importFlow(callbacks: SettingsSectionsCallbacks): void {
 /** Reused by the options page: same sections, same wording. */
 export function describeSettingsSummary(settings: ExtensionSettings): string {
   const where = settings.uiMode === 'sidepanel' ? 'side panel' : 'popup';
-  return `${settings.maxConcurrency} at once · ${settings.filenameTemplate} · opens in the ${where}`;
+  return `${settings.maxConcurrency} start worker(s) · ${settings.filenameTemplate} · opens in the ${where}`;
 }

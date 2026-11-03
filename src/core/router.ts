@@ -1,3 +1,4 @@
+import { inspectPawchivePost, normalizePawchiveBaseUrl, parsePawchiveQuery } from '../adapters/pawchive.js';
 import { BooruError } from '../shared/errors.js';
 import type {
   BooruPost,
@@ -11,15 +12,15 @@ import type {
   TaskRun,
   TaskView,
 } from '../shared/types.js';
-import { deepClone, splitTags, uniqueBy } from '../shared/util.js';
+import { deepClone, redactUrl, splitTags, uniqueBy } from '../shared/util.js';
 import type { BooruClient } from './client.js';
-import type { Downloader } from './downloads.js';
+import { requireOriginalFile, type Downloader } from './downloads.js';
 import type { DiagnosticsInfo, RouterResponse, UiRequest } from './messages.js';
 import { buildDownloadPath, sanitizePathSegment } from './naming.js';
 import type { DownloadQueue } from './queue.js';
-import { detectAdapterForUrl, getAdapter } from './registry.js';
+import { createAdapterContext, detectAdapterForUrl, getAdapter } from './registry.js';
 import type { ServerStore } from './servers.js';
-import { toServerView } from './servers.js';
+import { sameServerConnection, toServerView } from './servers.js';
 import { DownloadHistoryStore, SearchHistoryStore } from './history.js';
 import {
   classifyMirrorLink,
@@ -90,10 +91,11 @@ function fileNameHint(filename: string | null | undefined): string {
 
 /**
  * One request handler for every surface (service worker, popup, options page and
- * the browser preview). The UI only ever sends `UiRequest`s - it never touches
- * an adapter, a credential or a network call itself.
+ * the browser preview). API actions use `UiRequest`s, although UI images can
+ * load remote thumbnails directly.
  *
- * No response in this file contains an unmasked secret.
+ * Server profile credentials are masked. Generated Hydrus URLs omit its key;
+ * mirror URLs retain fragments and may contain private keys.
  */
 export function createRouter(deps: RouterDeps): UiMessageHandler {
   const historyStore = deps.history ?? (deps.storage ? new DownloadHistoryStore(deps.storage) : null);
@@ -113,7 +115,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
 
   /** Empty answer for every links/* request when no storage is available. */
   function noLinks() {
-    return { links: [] as MirrorLink[], stats: { total: 0, new: 0, queued: 0, done: 0, failed: 0 } };
+    return { links: [] as MirrorLink[], stats: { total: 0, new: 0, queued: 0, done: 0, failed: 0, unverified: 0 } };
   }
   /** Resolve a post (by URL, by id, or the default server) and save the file. */
   async function downloadPost(options: { serverId?: string | null; postId?: string; url?: string }) {
@@ -149,9 +151,10 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
         tagSeparator: settings.tagSeparator,
       },
     });
-    const target = settings.filePreference === 'sample' && post.sampleUrl ? post.sampleUrl : post.fileUrl;
-    const outcome = await deps.downloader.download({
-      url: target,
+    requireOriginalFile(post);
+    const outcome = await deps.queue.startDirect({
+      server,
+      post,
       filename: path.fullPath,
       conflictAction: settings.duplicateBehaviour === 'overwrite' ? 'overwrite' : 'uniquify',
     });
@@ -164,6 +167,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
    * history and are left alone (the Queue tab has "Clear finished" for those).
    */
   async function dropPendingQueueRowsFor(linkIds: readonly string[]): Promise<void> {
+    await deps.queue.refresh();
     const wanted = new Set(linkIds);
     const rows = deps.queue
       .list()
@@ -192,14 +196,31 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
     return views;
   }
 
+  /** Mirror-link collection reads Pawchive post bodies; booru browsing is separate. */
+  async function pawchiveServer(id: string): Promise<ServerConfig> {
+    const server = await deps.servers.get(id);
+    if (!server) throw new BooruError(`Unknown server "${id}"`, { kind: 'incomplete-config' });
+    if (server.siteType !== 'pawchive') {
+      throw new BooruError('Link collection requires a Pawchive profile', {
+        kind: 'unsupported-site',
+        hint: 'Choose a Pawchive profile for creator links. Your booru profiles are still available for browsing and downloads.',
+      });
+    }
+    normalizePawchiveBaseUrl(server.baseUrl);
+    return server;
+  }
+
   /** The saved profile a task should be collected with (its own, else a match). */
   async function serverForTask(task: DownloadTask): Promise<ServerConfig | null> {
+    // A package from a retired site must never be silently rescanned as a
+    // different creator on Pawchive, even if a Pawchive profile is selected.
+    if (task.siteType && task.siteType !== 'pawchive') return null;
     if (task.serverId) {
       const own = await deps.servers.get(task.serverId);
-      if (own) return own;
+      if (own?.siteType === 'pawchive') return own;
     }
     if (!task.siteType) return null;
-    return (await deps.servers.list()).find((server) => server.siteType === task.siteType) ?? null;
+    return (await deps.servers.list()).find((server) => server.siteType === 'pawchive') ?? null;
   }
 
   /**
@@ -295,6 +316,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
         hint: 'Add a profile for this site type (Servers tab), then rescan.',
       });
     }
+    await pawchiveServer(server.id);
     const query = creatorQuery(task);
     if (!query) {
       throw new BooruError(`Task "${task.name}" does not remember a creator to re-list`, {
@@ -303,7 +325,11 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
       });
     }
 
-    const seen = new Set(task.scannedPosts);
+    // Older versions stored the first attachment index rather than the post id.
+    const seen = new Set(task.scannedPosts.map((id) => {
+      const parts = id.split('/');
+      return parts.length === 4 && /^\d+$/.test(parts[3] ?? '') ? parts.slice(0, 3).join('/') : id;
+    }));
     const pageSize = 50;
     const pageLimit = Math.max(1, Math.ceil(maxPosts / pageSize));
     let scanned = 0;
@@ -314,7 +340,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
     for (let page = 1; page <= pageLimit; page += 1) {
       const result = await deps.client.search(server.id, { tags: query, page, limit: pageSize });
       const posts = uniqueBy(
-        result.posts.map((post) => ({ id: post.id, postUrl: post.postUrl, label: post.description?.trim() || `#${post.id}` })),
+        result.sourcePosts ?? result.posts.map((post) => ({ id: post.id, postUrl: post.postUrl, label: post.description?.trim() || `#${post.id}` })),
         (post) => post.postUrl,
       );
       hasMore = result.hasMore;
@@ -340,7 +366,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
           );
           const stored = await linkStore.add(found);
           added += stored.addedIds.length;
-          await taskStore?.attachMembers(task.id, stored.addedIds, [post.id]);
+          await taskStore?.attachMembers(task.id, stored.resolvedIds, [post.id]);
         } catch {
           // One unreadable post must not end the rescan; it stays unscanned so the
           // next attempt picks it up again.
@@ -419,16 +445,21 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
 
       // -------------------------------------------------------------- browse
       case 'browse/search': {
-        // The shared layer adds the tag blacklist (adapters do not know about it);
-        // the *global suffix* is appended by the adapters themselves, so it must
-        // not be added here as well.
+        // Pawchive queries are creators/titles, not booru tag expressions.
+        // Adding a booru blacklist would turn `service/creator` into a title search.
+        const { server } = await deps.client.resolve(request.payload.serverId);
         const settings = await deps.settings.get();
-        const composed = composeSearchTags({ tags: request.payload.spec.tags ?? '', blacklist: settings.tagBlacklist });
-        return deps.client.search(request.payload.serverId, { ...request.payload.spec, tags: composed.tags });
+        const tags = server.siteType === 'pawchive'
+          ? request.payload.spec.tags ?? ''
+          : composeSearchTags({ tags: request.payload.spec.tags ?? '', blacklist: settings.tagBlacklist }).tags;
+        return deps.client.search(server.id, { ...request.payload.spec, tags });
       }
 
       case 'posts/get':
         return deps.client.getPost(request.payload.serverId, request.payload.postId);
+
+      case 'posts/thumbnail':
+        return { dataUrl: await deps.client.getHydrusThumbnail(request.payload.serverId, request.payload.postId) };
 
       case 'posts/resolveUrl': {
         const { post, server, route: resolved } = await deps.client.resolvePostFromUrl(request.payload.url);
@@ -446,6 +477,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
 
       // --------------------------------------------------------------- links
       case 'links/list': {
+        await deps.queue.refresh();
         if (!linkStore) return noLinks();
         return { links: await linkStore.list(), stats: await linkStore.stats() };
       }
@@ -460,15 +492,14 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
        * visible and the request spacing honest.
        */
       case 'links/posts': {
-        const settings = await deps.settings.get();
-        const composed = composeSearchTags({ tags: request.payload.query, blacklist: settings.tagBlacklist });
+        await pawchiveServer(request.payload.serverId);
         const result = await deps.client.search(request.payload.serverId, {
-          tags: composed.tags,
+          tags: request.payload.query,
           page: request.payload.page,
           limit: 50,
         });
         const posts = uniqueBy(
-          result.posts.map((post) => ({
+          result.sourcePosts ?? result.posts.map((post) => ({
             id: post.id,
             label: post.description?.trim() || `#${post.id}`,
             postUrl: post.postUrl,
@@ -489,13 +520,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
       case 'links/scanPost': {
         if (!linkStore) return { added: [] as MirrorLink[], duplicates: 0, total: 0 };
         const { serverId, postId } = request.payload;
-        const server = await deps.servers.get(serverId);
-        if (!server) {
-          throw new BooruError(`Unknown server "${serverId}"`, {
-            kind: 'incomplete-config',
-            hint: 'Pick the profile the links should be collected with, then try again.',
-          });
-        }
+        const server = await pawchiveServer(serverId);
         const payload = await deps.client.getPostPayload(server.id, postId);
         const found = collectMirrorLinks(
           payload,
@@ -514,10 +539,10 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
         // "download everything again" and "what is new?" answerable later.
         if (request.payload.taskId && taskStore) {
           const task = await taskStore.get(request.payload.taskId);
-          if (task) await taskStore.attachMembers(task.id, found.map((link) => link.id), [postId]);
+          if (task) await taskStore.attachMembers(task.id, result.resolvedIds, [postId]);
         }
         return {
-          added: found.filter((link) => result.addedIds.includes(link.id)),
+          added: found.filter((_link, index) => result.addedIds.includes(result.resolvedIds[index] ?? '')),
           duplicates: result.updated,
           total: result.total,
         };
@@ -530,6 +555,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
         const chosen = (await linkStore.list()).filter((link) => wanted.has(link.id));
         const result = await deps.queue.enqueueLinks(
           chosen.map((link) => ({
+            id: link.id,
             url: link.url,
             label: linkLabel(link),
             postUrl: link.postUrl,
@@ -537,7 +563,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
           })),
         );
         for (const link of chosen) {
-          if (link.status !== 'done') await linkStore.mark(link.id, 'queued');
+          await linkStore.mark(link.id, 'queued');
         }
         return { queued: result.added, skipped: result.skipped, invalid: result.invalid, links: await linkStore.list(), stats: await linkStore.stats() };
       }
@@ -612,13 +638,13 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
         const result = await linkStore.add(records);
         let queued = 0;
         if (request.payload.queue && records.length) {
+          const chosen = (await linkStore.list()).filter((link) => result.resolvedIds.includes(link.id));
           const enqueued = await deps.queue.enqueueLinks(
-            records.map((record) => ({ url: record.url, label: linkLabel(record), postUrl: record.postUrl, serverId: record.serverId })),
+            chosen.map((link) => ({ id: link.id, url: link.url, label: linkLabel(link), postUrl: link.postUrl, serverId: link.serverId })),
           );
           queued = enqueued.added;
-          for (const record of records) {
-            const stored = await linkStore.byId(record.id);
-            if (stored && stored.status !== 'done') await linkStore.mark(record.id, 'queued');
+          for (const link of chosen) {
+            await linkStore.mark(link.id, 'queued');
           }
         }
         return {
@@ -638,19 +664,15 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
        * the unit a package is exported as, and the unit "run it again" applies to.
        */
       case 'tasks/list': {
+        await deps.queue.refresh();
         return { tasks: await taskViews() };
       }
 
       /** Open (or fetch) the task a collect run belongs to, before scanning. */
       case 'tasks/begin': {
-        const server = await deps.servers.get(request.payload.serverId);
-        if (!server) {
-          throw new BooruError(`Unknown server "${request.payload.serverId}"`, {
-            kind: 'incomplete-config',
-            hint: 'Pick the profile the links should be collected with, then try again.',
-          });
-        }
+        const server = await pawchiveServer(request.payload.serverId);
         const query = request.payload.query.trim();
+        parsePawchiveQuery(query); // Reject creator URLs belonging to other sites.
         const parsed = parseCreatorQuery(query);
         const id = taskIdFor({ siteType: server.siteType, service: parsed.service, creator: parsed.creator, query });
         const { task, created } = await upsertTask({
@@ -680,7 +702,8 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
           return { kind: 'unknown' as const, created: false, parsed: 0, added: 0, updated: 0, invalid: 0, task: null, error: 'Storage is unavailable.' };
         }
         const parsed = parseTaskPackage(request.payload.text);
-        const server = request.payload.serverId ? await deps.servers.get(request.payload.serverId) : null;
+        const selectedServer = request.payload.serverId ? await deps.servers.get(request.payload.serverId) : null;
+        const server = selectedServer && (!parsed.task?.siteType || parsed.task.siteType === selectedServer.siteType) ? selectedServer : null;
 
         // Plain list: reuse the tolerant reader (bullets, comments, duplicates).
         const list = parsed.kind === 'json' ? null : parseLinkExport(request.payload.text);
@@ -719,7 +742,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
               verdict,
               {
                 serverId: server?.id ?? null,
-                siteType: (server?.siteType ?? parsed.task?.siteType ?? null) as MirrorLink['siteType'],
+                siteType: (parsed.task?.siteType ?? server?.siteType ?? null) as MirrorLink['siteType'],
                 postId: packaged?.postId ?? null,
                 postTitle: packaged?.postTitle ?? fromText?.postTitle ?? null,
                 postUrl: packaged?.postUrl ?? fromText?.postUrl ?? null,
@@ -768,7 +791,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
           service: identity.service,
           creator: identity.creator,
           query: identity.query || taskNameFor(identity),
-          memberIds: records.map((record) => record.id),
+          memberIds: stored.resolvedIds,
           scannedPosts: parsed.task?.scannedPosts ?? [],
           runs: parsed.task?.runs ?? [],
           lastScanAt: parsed.task?.lastScanAt ?? null,
@@ -833,6 +856,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
         const chosen = links.filter((link) => plan.ids.includes(link.id));
         const result = await deps.queue.enqueueLinks(
           chosen.map((link) => ({
+            id: link.id,
             url: link.url,
             label: linkLabel(link),
             postUrl: link.postUrl,
@@ -840,12 +864,12 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
           })),
         );
         for (const link of chosen) {
-          if (link.status !== 'done') await linkStore.mark(link.id, 'queued');
+          await linkStore.mark(link.id, 'queued');
         }
         task = (await taskStore.recordRun(task.id, startRun({ queued: result.added, note: statsLabel(taskStatsFor(task, await linkStore.list())) }))) ?? task;
         const settings = await deps.settings.get();
         const shouldStart = request.payload.start ?? settings.autoStartQueue;
-        if (shouldStart && result.added > 0) void deps.queue.run();
+        if (shouldStart && result.added > 0) await deps.queue.start();
         return {
           task: await taskViewFor(task),
           queued: result.added,
@@ -921,6 +945,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
 
       // --------------------------------------------------------------- queue
       case 'queue/list': {
+        await deps.queue.refresh();
         const settings = await deps.settings.get();
         return { summary: deps.queue.summary(), items: deps.queue.list(), maxConcurrency: settings.maxConcurrency };
       }
@@ -937,6 +962,34 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
         return { ...result, summary: deps.queue.summary() };
       }
 
+      case 'queue/enqueuePawchivePost': {
+        const { server, adapter } = await deps.client.resolve(request.payload.serverId);
+        if (server.siteType !== 'pawchive') {
+          throw new BooruError('This action requires a Pawchive post.', { kind: 'unsupported-site' });
+        }
+        const raw = await deps.client.getPostPayload(server.id, request.payload.postId);
+        const ctx = createAdapterContext(adapter, server, await deps.settings.get());
+        const inspected = inspectPawchivePost(raw, ctx);
+        let unavailable = inspected.unavailable;
+        const candidates = inspected.posts.filter((post) => {
+          try {
+            requireOriginalFile(post);
+            return true;
+          } catch {
+            unavailable += 1;
+            return false;
+          }
+        });
+        const result = await deps.queue.enqueuePosts(server.id, candidates.map((post) => ({
+          id: post.id,
+          label: post.description || `Pawchive ${post.id}`,
+          postUrl: post.postUrl,
+          rating: post.rating,
+          expectedFileHash: post.md5,
+        })));
+        return { ...result, unavailable, summary: deps.queue.summary() };
+      }
+
       case 'queue/enqueueLinks': {
         // Mirror links skip the adapter and the rating filter: the file is not
         // on the site, so there is nothing to look up and nothing to rate.
@@ -945,9 +998,8 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
       }
 
       case 'queue/run':
-        // Fire and forget - the UI polls `queue/list` for progress. `itemIds`
-        // restricts the run to the ticked rows (panel "Download selected").
-        void deps.queue.run({ onlyIds: request.payload?.itemIds });
+        // Persist the selection before replying; browser transfers continue in the background.
+        await deps.queue.start({ onlyIds: request.payload?.itemIds });
         return { started: true, summary: deps.queue.summary() };
 
       case 'queue/pause':
@@ -956,7 +1008,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
 
       case 'queue/resume':
         await deps.queue.resume();
-        void deps.queue.run();
+        await deps.queue.start();
         return { started: true, summary: deps.queue.summary() };
 
       case 'queue/retryFailed': {
@@ -982,6 +1034,7 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
 
       // ------------------------------------------------------------- history
       case 'history/list': {
+        await deps.queue.refresh();
         const entries = historyStore ? await historyStore.list() : [];
         return { entries, total: entries.length };
       }
@@ -1074,15 +1127,24 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    // A blank secret on an existing profile means "keep the stored one" - the UI
-    // never receives the stored key, so validation must fill it back in.
+    // Masked-edit validation may reuse credentials only for the same target;
+    // otherwise it could send an old API key to a newly configured server.
     if (input.id) {
       const existing = await deps.servers.get(input.id);
       if (existing) {
-        if (!draft.apiKey) draft.apiKey = existing.apiKey;
-        if (!draft.username) draft.username = existing.username;
-        if (!draft.userId) draft.userId = existing.userId;
-        if (!draft.customUserAgent) draft.customUserAgent = existing.customUserAgent;
+        const sameTarget = sameServerConnection(existing, draft);
+        if (!sameTarget && existing.apiKey && !draft.apiKey) {
+          throw new BooruError('Changing the server URL or site type requires an explicit credential choice.', {
+            kind: 'incomplete-config',
+            hint: 'Re-enter the key for the new server, or clear the old profile credentials before changing it.',
+          });
+        }
+        if (sameTarget) {
+          if (!draft.apiKey) draft.apiKey = existing.apiKey;
+          if (!draft.username) draft.username = existing.username;
+          if (!draft.userId) draft.userId = existing.userId;
+          if (!draft.customUserAgent) draft.customUserAgent = existing.customUserAgent;
+        }
       }
     }
     return draft;
@@ -1135,7 +1197,7 @@ export async function buildDiagnostics(deps: RouterDeps, includeUserAgentSync = 
       id: server.id,
       label: server.label,
       siteType: server.siteType,
-      baseUrl: server.baseUrl,
+      baseUrl: redactUrl(server.baseUrl),
       ratingFilterEnabled: server.ratingFilterEnabled,
       hasApiKey: !!server.apiKey,
       validationStatus: server.validationStatus,

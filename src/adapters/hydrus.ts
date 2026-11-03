@@ -3,7 +3,7 @@ import { BooruError } from '../shared/errors.js';
 import type { HttpResponseSnapshot, HttpRequestSpec } from '../shared/http.js';
 import type { BooruPost, Rating, RouteMatch, SearchResult, SearchSpec } from '../shared/types.js';
 import { asRecord, classifyStatus, pickBoolean, pickNumber, pickString, readJson, shapeError } from './base.js';
-import { hostMatchesPattern, splitTags, unique } from '../shared/util.js';
+import { hostMatchesPattern, splitTags, stripHydrusCredentials, unique } from '../shared/util.js';
 
 export const HYDRUS_VERSION = '0.1.0';
 export const HYDRUS_DEFAULT_BASE = 'http://127.0.0.1:45869';
@@ -34,17 +34,23 @@ export function composeHydrusTags(userQuery: string | undefined, globalSuffix: s
   return out.length ? out : ['system:everything'];
 }
 
-function withKey(url: URL, ctx: AdapterContext): URL {
-  const key = ctx.server.apiKey.trim();
-  if (key) url.searchParams.set(HYDRUS_KEY_PARAM, key);
-  return url;
+/** Hydrus IDs must be numeric and exactly representable by the JSON API. */
+export function hydrusFileId(fileId: string): string {
+  if (!/^\d+$/.test(fileId) || !Number.isSafeInteger(Number(fileId))) {
+    throw new BooruError('Invalid Hydrus file ID.', { kind: 'parse-failure' });
+  }
+  return String(Number(fileId));
 }
 
-export function hydrusFileUrl(baseUrl: string, fileId: string, key: string, kind: 'file' | 'thumbnail'): string {
+/** URLs are safe to show/store: authentication is carried separately. */
+export function hydrusFileUrl(baseUrl: string, fileId: string, kind: 'file' | 'thumbnail'): string {
   const url = new URL(`${baseUrl.replace(/\/+$/, '')}/get_files/${kind}`);
-  url.searchParams.set('file_id', fileId);
-  if (key) url.searchParams.set(HYDRUS_KEY_PARAM, key);
+  url.searchParams.set('file_id', hydrusFileId(fileId));
   return url.toString();
+}
+
+export function hydrusAuthHeaders(key: string): Record<string, string> {
+  return key.trim() ? { [HYDRUS_KEY_PARAM]: key.trim() } : {};
 }
 
 function classifyFailure(snapshot: HttpResponseSnapshot): AdapterFailure | null {
@@ -91,14 +97,13 @@ function extractTags(metadata: Record<string, unknown>): string[] {
  * missing extension/size/tags are filled in from `file_metadata` at that point.
  */
 function lightweightPost(fileId: string, ctx: AdapterContext): BooruPost {
-  const key = ctx.server.apiKey.trim();
   return {
     serverId: ctx.server.id,
     siteType: ctx.server.siteType,
     id: fileId,
-    postUrl: hydrusFileUrl(ctx.baseUrl, fileId, key, 'file'),
-    fileUrl: hydrusFileUrl(ctx.baseUrl, fileId, key, 'file'),
-    previewUrl: hydrusFileUrl(ctx.baseUrl, fileId, key, 'thumbnail'),
+    postUrl: hydrusFileUrl(ctx.baseUrl, fileId, 'file'),
+    fileUrl: hydrusFileUrl(ctx.baseUrl, fileId, 'file'),
+    previewUrl: hydrusFileUrl(ctx.baseUrl, fileId, 'thumbnail'),
     sampleUrl: null,
     width: null,
     height: null,
@@ -126,7 +131,6 @@ function normalizePost(raw: unknown, ctx: AdapterContext): BooruPost {
   const metadata = asRecord(raw);
   if (!metadata) throw shapeError('Hydrus file metadata', 'entry was not an object');
   const fileId = pickString(metadata, 'file_id') ?? '';
-  const key = ctx.server.apiKey.trim();
   const ext = (pickString(metadata, 'ext') ?? '').replace(/^\./, '').toLowerCase() || null;
   const mime = pickString(metadata, 'mime') ?? '';
   const tags = extractTags(metadata);
@@ -141,7 +145,9 @@ function normalizePost(raw: unknown, ctx: AdapterContext): BooruPost {
     else if (namespace === 'system' || namespace === 'meta' || namespace === 'filename' || namespace === 'page') categories.meta!.push(tag);
     else categories.general!.push(tag);
   }
-  const knownUrls = Array.isArray(metadata.known_urls) ? metadata.known_urls.filter((url): url is string => typeof url === 'string') : [];
+  const knownUrls = Array.isArray(metadata.known_urls)
+    ? metadata.known_urls.filter((url): url is string => typeof url === 'string').map(stripHydrusCredentials)
+    : [];
   const importedAt = pickNumber(metadata, 'time_imported');
   const duration = pickNumber(metadata, 'duration');
   const isVideo = mime.startsWith('video/');
@@ -149,9 +155,9 @@ function normalizePost(raw: unknown, ctx: AdapterContext): BooruPost {
     serverId: ctx.server.id,
     siteType: ctx.server.siteType,
     id: fileId,
-    postUrl: hydrusFileUrl(ctx.baseUrl, fileId, key, 'file'),
-    fileUrl: hydrusFileUrl(ctx.baseUrl, fileId, key, 'file'),
-    previewUrl: hydrusFileUrl(ctx.baseUrl, fileId, key, 'thumbnail'),
+    postUrl: hydrusFileUrl(ctx.baseUrl, fileId, 'file'),
+    fileUrl: hydrusFileUrl(ctx.baseUrl, fileId, 'file'),
+    previewUrl: hydrusFileUrl(ctx.baseUrl, fileId, 'thumbnail'),
     sampleUrl: null,
     width: pickNumber(metadata, 'width'),
     height: pickNumber(metadata, 'height'),
@@ -223,9 +229,9 @@ function interpretKeyProbe(snapshot: HttpResponseSnapshot): ProbeInterpretation 
  * Hydrus Network Client API adapter (a *local* booru: your own client).
  *
  * - Base URL is the client's API address, `http://127.0.0.1:45869` by default.
- * - Auth: an access key created in the client, sent as the
- *   `Hydrus-Client-API-Access-Key` query parameter (the header form cannot be
- *   used for `<img>` thumbnails or `chrome.downloads`).
+ * - Auth: a `Hydrus-Client-API-Access-Key` header; URLs contain no key.
+ *   Metadata/thumbnail fetches reject redirects. Chrome downloads can follow
+ *   redirects, so header privacy on that path still requires browser testing.
  * - Listing: `/get_files/search_files` returns *every* matching file id; the
  *   adapter pages through that list locally, and the queue fetches
  *   `/get_files/file_metadata` per file before downloading.
@@ -244,7 +250,7 @@ export const hydrusAdapter: BooruAdapter = {
     requiresUserId: false,
     requiresApiKey: true,
     requiresUserAgent: false,
-    authStyle: 'query',
+    authStyle: 'header',
     supportsBasicAuthHeader: false,
     maxPostsPerRequest: 100,
     maxPage: null,
@@ -254,6 +260,8 @@ export const hydrusAdapter: BooruAdapter = {
     supportsIdPagination: false,
     apiDocsUrl: 'https://hydrusnetwork.github.io/hydrus/developer_api.html',
     notes: [
+      'Security: Hydrus keys use headers, but Chrome download redirects and browser storage of headers have not been verified. Use a trusted direct endpoint and a restricted key.',
+      'Older versions put keys in URLs and browser history. Rotate an exposed key and remove old Chrome download records.',
       'Talks to your own Hydrus client: enable the Client API under services > manage services and create an access key with "search for and fetch files".',
       'Base URL is plain http on localhost; the extension asks for optional host access to it once.',
       'Search terms are comma separated Hydrus tags (namespaces allowed, `-tag` excludes, `system:` predicates work). Empty = system:everything.',
@@ -295,23 +303,23 @@ export const hydrusAdapter: BooruAdapter = {
   },
 
   postUrl(baseUrl: string, postId: string): string {
-    return hydrusFileUrl(baseUrl, postId, '', 'file');
+    return hydrusFileUrl(baseUrl, postId, 'file');
   },
 
   buildSearchRequest(ctx, spec): HttpRequestSpec {
-    const url = withKey(new URL(`${ctx.baseUrl}/get_files/search_files`), ctx);
+    const url = new URL(`${ctx.baseUrl}/get_files/search_files`);
     url.searchParams.set('tags', JSON.stringify(composeHydrusTags(spec.tags, ctx.settings.globalTagSuffix)));
     // Sort by import time, newest first, so paging is stable-ish between requests.
     url.searchParams.set('file_sort_type', '2');
     url.searchParams.set('file_sort_asc', 'false');
     url.searchParams.set('return_file_ids', 'true');
-    return { url: url.toString(), method: 'GET', headers: { Accept: 'application/json' }, tag: 'hydrus', label: 'Search files' };
+    return { url: url.toString(), method: 'GET', headers: { Accept: 'application/json', ...hydrusAuthHeaders(ctx.server.apiKey) }, redirect: 'error', tag: 'hydrus', label: 'Search files' };
   },
 
   buildPostRequest(ctx, postId): HttpRequestSpec {
-    const url = withKey(new URL(`${ctx.baseUrl}/get_files/file_metadata`), ctx);
-    url.searchParams.set('file_ids', JSON.stringify([Number(postId)]));
-    return { url: url.toString(), method: 'GET', headers: { Accept: 'application/json' }, tag: 'hydrus', label: `Fetch file ${postId} metadata` };
+    const url = new URL(`${ctx.baseUrl}/get_files/file_metadata`);
+    url.searchParams.set('file_ids', JSON.stringify([Number(hydrusFileId(postId))]));
+    return { url: url.toString(), method: 'GET', headers: { Accept: 'application/json', ...hydrusAuthHeaders(ctx.server.apiKey) }, redirect: 'error', tag: 'hydrus', label: `Fetch file ${postId} metadata` };
   },
 
   buildValidationProbes(ctx): ValidationProbe[] {
@@ -330,9 +338,10 @@ export const hydrusAdapter: BooruAdapter = {
         purpose: 'auth',
         enabled: hasKey,
         request: {
-          url: withKey(new URL(`${ctx.baseUrl}/verify_access_key`), ctx).toString(),
+          url: new URL(`${ctx.baseUrl}/verify_access_key`).toString(),
           method: 'GET',
-          headers: { Accept: 'application/json' },
+          headers: { Accept: 'application/json', ...hydrusAuthHeaders(ctx.server.apiKey) },
+          redirect: 'error',
           tag: 'hydrus',
           label: 'Credential check',
         },
@@ -371,7 +380,8 @@ export const hydrusAdapter: BooruAdapter = {
     const parsed = readJson<unknown>(snapshot, `Hydrus file ${postId}`);
     const record = asRecord(parsed);
     const list = record && Array.isArray(record.metadata) ? record.metadata : [];
-    const entry = list.find((item) => pickString(asRecord(item), 'file_id') === postId) ?? list[0];
+    const requestedId = hydrusFileId(postId);
+    const entry = list.find((item) => pickString(asRecord(item), 'file_id') === requestedId);
     if (!entry) throw new BooruError(`Hydrus has no file ${postId}`, { kind: 'parse-failure', status: snapshot.status });
     return normalizePost(entry, ctx);
   },
@@ -402,7 +412,7 @@ export const hydrusAdapter: BooruAdapter = {
         requiredForAuth: true,
         secret: true,
         placeholder: '64 hex characters from services > review services > client api',
-        help: 'Needs the "search for and fetch files" permission. Sent as a query parameter so thumbnails and downloads can use it too.',
+        help: 'Needs "search for and fetch files". Use a restricted key and a trusted direct endpoint; Chrome download redirects and header storage have not been verified. Rotate keys exposed by older versions.',
       },
     ];
   },

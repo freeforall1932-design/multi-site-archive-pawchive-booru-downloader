@@ -1,4 +1,5 @@
 import type { AdapterCatalogEntry } from '../core/messages.js';
+import { isUsableServer } from '../core/servers.js';
 import type { ServerConfigView } from '../shared/types.js';
 import { h, button, icon } from './dom.js';
 import { accountLine, ratingFilterLine, siteTypeChip, siteTypeLabel, validationDot } from './format.js';
@@ -56,6 +57,7 @@ export function renderServerList(container: HTMLElement, state: ServerListState,
       state.servers.length
         ? h('input', {
             class: 'search-input',
+            id: 'server-filter',
             type: 'search',
             placeholder: 'Filter servers…',
             value: state.filter,
@@ -97,13 +99,14 @@ function emptyState(adapters: AdapterCatalogEntry[], callbacks: ServerListCallba
         button(`Add ${adapter.displayName}`, { onClick: () => callbacks.onAdd(adapter.siteType) }),
       ),
     ),
-    h('p', { class: 'muted small', text: 'Credentials are stored in chrome.storage.local and only sent to the site you configured.' }),
+    h('p', { class: 'muted small', text: 'Credentials are stored locally and used for configured sites. Review the security notes, especially for redirects and HTTP.' }),
   );
 }
 
 function serverCard(server: ServerConfigView, state: ServerListState, callbacks: ServerListCallbacks): HTMLElement {
   const busy = state.busyId === server.id;
   const adapter = state.adapters.find((entry) => entry.siteType === server.siteType);
+  const usable = !!adapter && isUsableServer(server);
 
   return h(
     'article',
@@ -120,6 +123,9 @@ function serverCard(server: ServerConfigView, state: ServerListState, callbacks:
         siteTypeChip(server.siteType),
       ),
       h('div', { class: 'mono server-url', text: server.baseUrl }),
+      !adapter
+        ? h('div', { class: 'muted small', text: 'This legacy site is no longer supported. Its profile is kept for export or deletion; it cannot be used for downloads.' })
+        : !usable ? h('div', { class: 'muted small', text: 'This profile has an unsupported or invalid URL. Edit it to choose a supported site URL.' }) : null,
       h(
         'div',
         { class: 'server-meta' },
@@ -140,12 +146,12 @@ function serverCard(server: ServerConfigView, state: ServerListState, callbacks:
       { class: 'server-card-actions' },
       busy
         ? h('span', { class: 'spinner', attrs: { 'aria-label': 'Validating' } })
-        : button('Test', { iconName: 'refresh', onClick: () => callbacks.onTest(server) }),
-      button('Edit', { iconName: 'edit', onClick: () => callbacks.onEdit(server) }),
-      button('Duplicate', { iconName: 'copy', onClick: () => callbacks.onDuplicate(server) }),
+        : button('Test', { iconName: 'refresh', disabled: !adapter, onClick: () => callbacks.onTest(server) }),
+      button('Edit', { iconName: 'edit', disabled: !adapter, onClick: () => callbacks.onEdit(server) }),
+      button('Duplicate', { iconName: 'copy', disabled: !adapter, onClick: () => callbacks.onDuplicate(server) }),
       server.isDefault
         ? null
-        : button('Set default', { iconName: 'star', onClick: () => callbacks.onSetDefault(server) }),
+        : button('Set default', { iconName: 'star', disabled: !usable, onClick: () => callbacks.onSetDefault(server) }),
       button('Delete', { variant: 'danger', iconName: 'trash', onClick: () => callbacks.onDelete(server) }),
     ),
   );

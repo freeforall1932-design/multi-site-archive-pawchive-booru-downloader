@@ -16,6 +16,7 @@
  * exactly what the user can read in the UI.
  */
 import type { MirrorLink, MirrorLinkStats, MirrorLinkStatus } from '../shared/types.js';
+import { legacyMegaKeylessUrl, manualMirrorProvider, mirrorLinkId } from './links.js';
 import { STORAGE_KEYS, type StorageArea } from './storage.js';
 
 /** Hard ceiling so a long-lived profile cannot grow the list without bound. */
@@ -28,14 +29,19 @@ function isMirrorLink(value: unknown): value is MirrorLink {
 
 /** Fill in fields an older/partial record may lack. */
 function normalizeLink(link: MirrorLink): MirrorLink {
+  // Every old "done" was only a start; even a quality-tagged record might have
+  // been interrupted. Retain it as unverified rather than skipping it as saved.
+  const legacyDone = link.status === 'done' && link.completion !== 'browser-complete';
+  // Known provider shares are not direct files even if a browser saved HTML.
+  const legacyShareDone = link.status === 'done' && !!manualMirrorProvider(link.url);
   return {
     ...link,
     provider: link.provider || link.host,
-    status: link.status ?? 'new',
+    status: legacyShareDone ? 'new' : legacyDone ? 'unverified' : link.status ?? 'new',
     attempts: link.attempts ?? 0,
-    error: link.error ?? null,
-    filename: link.filename ?? null,
-    bytes: link.bytes ?? null,
+    error: legacyShareDone ? null : legacyDone ? 'Older version recorded a start only; check Chrome Downloads before retrying.' : link.error ?? null,
+    filename: legacyShareDone ? null : link.filename ?? null,
+    bytes: legacyShareDone ? null : link.bytes ?? null,
     addedAt: link.addedAt ?? new Date().toISOString(),
     updatedAt: link.updatedAt ?? link.addedAt ?? new Date().toISOString(),
   };
@@ -74,7 +80,7 @@ export class MirrorLinkStore {
 
   async stats(): Promise<MirrorLinkStats> {
     const links = await this.list();
-    const stats: MirrorLinkStats = { total: links.length, new: 0, queued: 0, done: 0, failed: 0 };
+    const stats: MirrorLinkStats = { total: links.length, new: 0, queued: 0, done: 0, failed: 0, unverified: 0 };
     for (const link of links) stats[link.status] += 1;
     return stats;
   }
@@ -95,26 +101,43 @@ export class MirrorLinkStore {
    * download outcome - `done`, `failed`, its filename and error - is preserved,
    * so re-scanning a creator never hides a file you already have.
    */
-  async add(links: readonly MirrorLink[]): Promise<{ added: number; updated: number; total: number; addedIds: string[] }> {
+  async add(links: readonly MirrorLink[]): Promise<{ added: number; updated: number; total: number; addedIds: string[]; resolvedIds: string[] }> {
     return this.serialize(async () => {
       const existing = await this.list();
       const index = new Map(existing.map((link) => [link.id, link]));
+      const byUrl = new Map(existing.map((link) => [link.url, link.id]));
       let added = 0;
       let updated = 0;
       const addedIds: string[] = [];
+      // One stored ID for each input, including old IDs retained on recovery.
+      const resolvedIds: string[] = [];
 
       for (const incoming of links) {
-        const current = index.get(incoming.id);
+        const exactId = byUrl.get(incoming.url);
+        let current = exactId ? index.get(exactId) : undefined;
+        let recoveredKey = false;
+        if (!current) {
+          const keyless = legacyMegaKeylessUrl(incoming.url);
+          const legacy = keyless ? index.get(mirrorLinkId(keyless)) : undefined;
+          // Reuse only a genuinely keyless old row. Distinct keyed URLs must
+          // stay distinct; old /#... links have no recoverable identity.
+          if (legacy && legacy.url === keyless) {
+            current = legacy;
+            recoveredKey = true;
+          }
+        }
         if (!current) {
           const record = normalizeLink(incoming);
           index.set(record.id, record);
+          byUrl.set(record.url, record.id);
           added += 1;
           addedIds.push(record.id);
+          resolvedIds.push(record.id);
           continue;
         }
-        index.set(current.id, {
+        const next: MirrorLink = {
           ...current,
-          url: current.url,
+          url: recoveredKey ? incoming.url : current.url,
           host: incoming.host || current.host,
           provider: incoming.provider || current.provider,
           serverId: incoming.serverId ?? current.serverId,
@@ -123,15 +146,25 @@ export class MirrorLinkStore {
           postTitle: incoming.postTitle ?? current.postTitle,
           postUrl: incoming.postUrl ?? current.postUrl,
           creator: incoming.creator ?? current.creator,
+          // Old Mega "done" could have been a saved HTML landing page, not a
+          // file. Preserve a pending queue relationship, but not that outcome.
+          status: recoveredKey && current.status !== 'queued' ? 'new' : current.status,
+          filename: recoveredKey ? null : current.filename,
+          bytes: recoveredKey ? null : current.bytes,
+          error: recoveredKey ? null : current.error,
           updatedAt: new Date().toISOString(),
-        });
+        };
+        index.set(current.id, next);
+        byUrl.delete(current.url);
+        byUrl.set(next.url, next.id);
+        resolvedIds.push(next.id);
         updated += 1;
       }
 
       const next = [...index.values()].slice(-MAX_MIRROR_LINKS);
       this.cache = next;
       await this.area.set(STORAGE_KEYS.links, next);
-      return { added, updated, total: next.length, addedIds };
+      return { added, updated, total: next.length, addedIds, resolvedIds };
     });
   }
 
@@ -151,7 +184,7 @@ export class MirrorLinkStore {
       const links = await this.list();
       if (scope === 'all') this.cache = [];
       else if (scope === 'done') this.cache = links.filter((link) => link.status !== 'done');
-      else this.cache = links.filter((link) => link.status === 'done' || link.status === 'failed');
+      else this.cache = links.filter((link) => link.status !== 'new' && link.status !== 'queued');
       await this.area.set(STORAGE_KEYS.links, this.cache);
       return links.length - this.cache.length;
     });
@@ -168,6 +201,7 @@ export class MirrorLinkStore {
         ...current,
         ...patch,
         status,
+        completion: status === 'done' ? 'browser-complete' : undefined,
         attempts: patch.attempts ?? current.attempts,
         updatedAt: new Date().toISOString(),
       };

@@ -1,10 +1,11 @@
 # Manual test plan
 
-The automated suite (478 tests) covers the adapters, the shared services, the
+The automated suite covers the adapters, the shared services, the
 panel's shared logic, the mirror-link rules, download tasks and the message
 protocol. This document covers what only a
 human can check: the real extension in a real browser, the UI states, and the
-failure messages a user sees.
+failure messages a user sees. This is a test plan, not a report of completed
+live testing; the current Pawchive changes have not been tested against the live site.
 
 Legend: **[V]** = can also be exercised in the offline preview harness
 (`npm run preview`) without touching a live site. **[P]** = panel-specific; the
@@ -36,20 +37,99 @@ Test profiles you may want, in the order that makes later tests easy:
 
 ---
 
+## 0a. Pawchive and original-only checks (not yet performed live)
+
+- With a permitted Pawchive profile, open a post exposing several original
+  attachments. Press **Add all available files**, confirm the number of queued
+  slots, then press **Download selected**. Check Chrome Downloads and the resulting
+  image/video dimensions and files manually. No post HTML/text is expected.
+- Check a preview-only/deferred attachment: it should be counted unavailable,
+  not downloaded as a thumbnail. Check a creator listing expands file slots.
+- Compare API fields for booru image/video samples with the URLs Chrome starts;
+  confirm the original field is used. Test a post without an original: it must
+  fail rather than fall back. This still does not prove every host's bytes.
+- Recollect a Mega share with a fragment key; export/re-import both text and JSON,
+  confirm the key survives, and use the provider site/downloader. Never publish
+  private share keys when reporting results.
+- Existing Pawchive queue rows from before the index update must be removed and
+  re-added. Exercise history and retry with a deliberately interrupted browser
+  transfer: it should become failed, never browser-confirmed history.
+
+## 0b. Real Chrome completion and restart checks (not yet performed live)
+
+These checks require the unpacked extension in Chrome and a permitted test host;
+the offline preview simulates completion and cannot validate browser events.
+Use files large/slow enough to observe the active state:
+
+1. Start a direct post, a queued post, and a direct mirror file. Confirm each is
+   running, not in completion history, until Chrome reports complete. Compare the
+   displayed bytes with Chrome Downloads; an unknown total must not show a made-up
+   percentage. After completion check history, mirror and task counters.
+2. Interrupt a transfer in Chrome (or disconnect the network), check `failed`,
+   no success history and retry; a resumed download in Chrome should update its
+   existing row. Cancel one from the extension and verify Chrome actually cancels.
+3. Stop the extension service worker from `chrome://extensions` during a transfer.
+   Reopen the queue and confirm the same Chrome download ID is reconciled without a
+   duplicate; also test a transfer that completes while the worker is stopped.
+4. Clear the Chrome Downloads record of an active transfer (where possible). The
+   extension must show unverified, not success. Old start-only rows/history must
+   remain visible/retained and must not make skip-history hide originals. Check the
+   actual file before retrying any unverified row.
+5. Confirm clear/remove leaves in-flight rows tracked. Pause stops new starts, not
+   existing Chrome transfers. Confirm that browser completion alone does not claim
+   a hash or validate response contents.
+6. Force a lost worker message after a download starts and a storage failure after
+   an ID is accepted. Confirm no automatic replay or duplicate start; inspect the
+   queue and Chrome Downloads before any manual retry.
+7. Check validation and search respect the configured API-attempt count and
+   spacing; note that limiter state is lost on worker restart.
+
+## 0c. Hydrus and security checks (not yet performed in an installed extension)
+
+1. Use a **disposable, restricted** Hydrus key and a trusted direct local Client
+   API endpoint. Validate, search, view thumbnails and download one original;
+   confirm the key is in the header, not returned URLs, queue/history, browser
+   address bar, exported diagnostics or Chrome Download URLs. Check file bytes
+   independently. Repeat with a wrong key and insufficient permissions.
+2. With controlled test endpoints and a fake key, observe **Chrome Downloads**
+   custom-header behavior for same-origin and cross-origin redirects; also inspect
+   whether the browser stores request headers. Do not use a real key. Metadata and
+   thumbnail fetches should reject redirects. Ordinary-page fetch testing is not
+   evidence about Chrome Downloads.
+3. Seed legacy key-bearing Hydrus queue/history post URLs and restart the worker;
+   check their known key parameters are removed. Confirm mirror links and Mega
+   fragments are unchanged. Check Chrome Downloads/browser records and old exports
+   separately: they are not cleaned by this migration. Rotate any key previously
+   exposed by an older version.
+4. Disable queue thumbnails, queue Hydrus posts and mirror links, and delete a
+   post's profile: no thumbnail request should occur for those rows; a missing
+   profile should be marked and should not open an unknown post URL.
+5. Test User-Agent rewrite rules from extension and ordinary web-page requests,
+   including matching subdomains, before attempting initiator restrictions.
+6. Verify custom HTTPS and loopback HTTP permission prompts in real Chrome. Confirm
+   non-loopback HTTP is not silently treated as granted.
+7. In both profile editors, server filters, Browse ranges and Settings, type and
+   edit multiple characters, insert in the middle, and use an IME. Delay a settings
+   response while typing; newer text must survive. Panel edits autosave; options
+   drafts need Save. During a profile save its controls should be disabled. Check
+   failed validation blocks a normal save but **Save anyway** remains available.
+   Mock-preview keyboard tests passed, but real MV3 has not run.
+
 ## 1. Side panel [P]
 
-`[P]` = do this in the real browser (load `dist/` unpacked); the preview harness
-covers the same flow with mock data.
+`[P]` marks panel-specific checks. The preview covers many UI flows with mock
+data; only a real unpacked extension can verify Chrome APIs and browser behavior.
 
 1. Click the toolbar icon → the **side panel** opens next to the page. Status pill
-   reads *Ready*; the tab strip shows Browse · Queue · Servers · Settings.
+   reads *Ready*; the tab strip shows Browse · Queue · Links · Servers · Settings.
 2. **Context card.** Open `https://e621.net/posts/<id>` (or a mock URL in the
    harness) → the card names the matching profile and its route (`post #12345`).
    Press ⟳ with a non-booru tab active → the card says the page is not a supported
    booru, and the search box still works.
 3. **Post card.** On a post page the card shows a thumbnail, rating chip and size,
-   with *Download this post* / *Add to list*. After a download the row shows a
-   `saved …` badge; after *Add to list* the button becomes *In the queue*.
+   with *Download this file* / *Add to list*. After a download the row shows a
+   `completed …` badge only after Chrome reports completion; after *Add to list*
+   the button becomes *In the queue*.
 4. **Listing.** Type `cityscape` and press *List this page* → rows appear in the
    list below, all ticked, and the dock button reads *Download selected (n)*. The
    hint says how many rows were added and how many were skipped.
@@ -58,14 +138,14 @@ covers the same flow with mock data.
    *Fetch selected pages* is disabled. Enter `1-9999` with *Pages per fetch* = 150 →
    the message explains the cap.
 6. **Filters.** Set *Media* to *Videos only* → pictures disappear from the list.
-   Untick *Skip downloaded*, re-run a search you already downloaded → rows come
-   back with a `saved` badge instead of being omitted.
+   Leave *Skip posts previously completed* off (the default), re-run a search you
+   already completed → rows return with a `completed` badge.
 7. **Selective run.** Untick one row, press *Download selected (n)* → only the
    ticked rows run; the unticked row stays `queued`. Press *Start queued (1)* on
    the dock → it downloads too.
-8. **Dock controls.** Change *Downloads at once* → the setting persists (Settings →
-   *Downloads at once* matches). Switch *Quality* to *Sample* → the next download
-   uses the sample URL when the post has one.
+8. **Dock controls.** Change *Start workers* → the setting persists. The dock
+   says original-only; there is no sample-quality switch. For a post with distinct
+   original and sample video/image URLs, verify the request uses the original.
 9. **Row actions.** ✕ on a queued row removes it from the list (the file on disk is
    untouched); ✕ on a running row cancels just that download. *Retry failed*,
    *Clear finished*, *Reset history* and *Clear list* each report what they did.
@@ -137,8 +217,9 @@ Then run the validation matrix. Expected *reason* text, not just red/green:
 | 3.8 | Site that returns 429/503 (e.g. validate e621 repeatedly, or `force:429` in the harness) | **Rate limited** — distinct message and hint, not auth/endpoint |
 | 3.9 | Credentials left blank entirely | Validation succeeds as a **read-only** profile with a warning |
 | 3.10 | e621 profile with a `Mozilla/5.0 … Chrome/…` User-Agent | Success plus a warning that a browser-like UA violates the site policy |
-| 3.11 | Plain `http://` base URL | Success plus a plain-HTTP warning |
-| 3.12 | Cancel while validation is running | UI returns to idle; no unhandled rejection in the console |
+| 3.11 | Non-loopback `http://` base URL | Preflight warns about plain HTTP; the manifest does not grant arbitrary non-loopback HTTP access, so the probe may fail. Loopback HTTP can be requested for a local client. |
+| 3.12 | Close the editor while validation is running | The editor closes; the already-started request is not guaranteed to be aborted. Check for an unhandled error. |
+| 3.12a | Base URL contains `user:password@` | Validation and save reject it before a network request; legacy views/exports mask it. |
 
 Form behaviour:
 
@@ -162,7 +243,7 @@ Form behaviour:
 | 4.5 | Search nonsense tags | Empty state, no error |
 | 4.6 | Search `force:html` (preview) | Red *Endpoint mismatch* error, retry possible |
 | 4.7 | Select two posts → **Queue selected (2)** | Toast/confirmation and the queue tab shows the two items |
-| 4.8 | Press **Download** on one post | File is saved, the post card shows the saved filename |
+| 4.8 | Press **Download** on one post | Original-file request starts and appears in the queue; the completed badge/history appears only when Chrome reports completion. Verify actual content separately. |
 
 ## 5. Queue [V]
 
@@ -175,18 +256,18 @@ Form behaviour:
 | 5.5 | Queue the same post twice (via browse + popup) | Second attempt is ignored as a duplicate (pending/running de-duplication) |
 | 5.6 | Queue an explicit post on a safe-only profile | It is reported as skipped by the rating filter, not downloaded |
 | 5.7 | Break a profile’s key, then run its queue | Items fail with the *Authentication failed* kind; error text contains no credentials |
-| 5.8 | **Retry failed** | Failed items return to pending and re-run |
-| 5.9 | **Clear done** / **Clear all** | Only the matching rows disappear |
-| 5.10 | Close the options page during a run, reopen the queue | Progress is intact (persisted state), running items resume from pending after a browser restart |
+| 5.8 | **Retry failed / unverified** | Failed or unverified items return to pending after confirmation; check ambiguous old starts first to avoid duplicates. |
+| 5.9 | **Clear completed** / **Clear all** | Matching inactive rows disappear; active transfers remain tracked. |
+| 5.10 | Close the options page and restart the extension worker during a slow transfer | The saved Chrome ID is reconciled; no duplicate is started. The row becomes completed or failed only when Chrome reports it. |
 | 5.11 | Queue a post on a server whose profile was deleted meanwhile | Skip with *Unsupported site type* reason instead of an infinite retry loop |
 
 ## 5a. Mirror links (Links tab) [V]
 
 The preview harness ships a demo creator whose posts carry mirror links, so the
 whole flow - collect, queue, export, import - can be walked without a live site.
-On a real profile, `pawchive` / `kemono` / `coomer` are the site types that can
-collect (the tab says *archive API*); any other profile disables the Collect
-button on purpose.
+On a real profile, only `pawchive` can collect (the tab says *archive API*);
+booru and discontinued archive profiles do not enable collection. Old profiles
+remain exportable/deletable but cannot be selected or made the default.
 
 | # | Steps | Expected |
 | --- | --- | --- |
@@ -196,7 +277,7 @@ button on purpose.
 | 5a.4 | Press **Stop** mid-collection | It stops after the post in flight; everything found so far is kept and the button returns to *Collect links* |
 | 5a.5 | Settings → *Mirror links* → set **Only download-looking links** to *Every external link*, re-collect | The gallery link now appears; the toolbar button in the Links tab reads `filter: every external link` |
 | 5a.6 | Tick a few rows → **Add to download queue (n)** | Toast; the Queue tab shows the rows with a `link` badge; the Links rows read *in the queue*; nothing hits the site's own API |
-| 5a.7 | Run the queue | Link rows download through the browser's downloader into `mirrors/<host>/…` (per the template), slowly, one URL per row; a row to a hosting page that needs a login fails and keeps its error text |
+| 5a.7 | Run the queue | Direct file URLs start under `mirrors/<host>/…`, and remain queued until Chrome reports their outcome; known share pages fail with an open/export message. Preview completion is simulated. |
 | 5a.8 | **Export .txt** (grouped by post) | A `<creator>_download_links.txt` file downloads; it starts with `# Booru Server Manager — collected mirror links`, lists `# Post: <title> — <url>` sections and one `- <url>` line per link |
 | 5a.9 | **Clear list** → confirm | The list empties; pending link rows leave the queue; a running download is not killed; the file on disk stays |
 | 5a.10 | **Import .txt…** → pick the file just exported | Rows come back grouped by their post titles, summary matches the export, the dock notice reports how many were added/known/unreadable; new rows arrive ticked |
@@ -215,14 +296,14 @@ come back as one idle task.
 
 | # | Steps | Expected |
 | --- | --- | --- |
-| 5b.1 | Links tab → *Collect links* for `fanbox/1245946` | One **task card** appears, named `1245946 · fanbox`, with a `pawchive` / `fanbox` badge, `n/n file(s) saved`, and a *Download missing (n)* button |
+| 5b.1 | Links tab → *Collect links* for `fanbox/1245946` | One **task card** appears, named `1245946 · fanbox`, with a `pawchive` / `fanbox` badge, `n/n file(s) completed`, and a *Download missing (n)* button |
 | 5b.2 | Click the ▸ on the card | The card expands into one row per file, each with its provider badge, its post, its status and its URL |
-| 5b.3 | Press **Download missing (n)** | Toast + notice ("n file(s) queued"); the Queue tab shows the rows; the card turns *downloading* and the counters move as files finish; it ends on **complete** |
-| 5b.4 | Press it again | "Nothing left to download" — every file is already saved, and the card says how many were skipped (`n / n done`) |
+| 5b.3 | Press **Download missing (n)** | Direct links remain queued until Chrome completes or interrupts them; known share pages fail with an open/export message. |
+| 5b.4 | Press it again | Browser-confirmed completions are skipped; failures and unverified starts can be retried. Content/hash verification is not inferred. |
 | 5b.5 | **Pause** while files are queued | The task's waiting files leave the queue, the card goes back to "n not downloaded" and the button says *Download missing* again; a download already running is not killed |
 | 5b.6 | Break one link's host (edit the row's URL in devtools, or import a list with a dead URL), then Download missing | Only that file fails; the card reads **partial - some files failed**, the file keeps its error text, and the next *Download missing* queues the failed file again (and never the saved ones) |
 | 5b.7 | **Rescan** a task that was collected already | "0 new post(s) scanned" — the second pass is incremental, it does not walk the creator again from scratch |
-| 5b.8 | Reload the panel and the browser | Task, files, statuses, run history and card expansion state survive (`bsm.tasks`, `bsm.links`) |
+| 5b.8 | Reload the panel and the browser | Task, files, statuses and run history survive (`bsm.tasks`, `bsm.links`); card expansion is in-memory UI state and may reset. |
 | 5b.9 | **Export package** | Two files download: `<name>_task.json` (manifest with `files` and `runs`) and `<name>_download_links.txt` (grouped list). Both open as plain text |
 | 5b.10 | Open the manifest in a text editor | Readable: `format`, `task` (id/name/site/service/creator), `summary` (total/done/failed/pending/completion), `files` (url, provider, post, status, filename) and `runs` |
 | 5b.11 | Harness page → **Reset preview data**, then Links tab → *Import package…* → pick the `.json` | One task comes back, **idle**, with the same name and file count; the notice reports how many were new vs already known; nothing downloads |
@@ -246,8 +327,9 @@ come back as one idle task.
 
 ## 7. Settings [V]
 
-The options page and the panel's Settings tab render the same sections; check one
-of each area rather than all of them twice: *Global behaviour* (toolbar mode),
+The options page and the panel's Settings tab render the same sections, but the
+panel autosaves edits while the options page keeps a draft until **Save settings**.
+Check one of each area rather than all of them twice: *Global behaviour* (toolbar mode),
 *Multiple download* (concurrency, spacing, retries, duplicates), *Mirror links*
 (filter, extra hosts, folder template), *List results*
 (media filter, page cap, queue rows, skip downloaded), *Search behaviour* (suffix,
@@ -274,7 +356,7 @@ blacklist, search history), *Name template* (checkboxes + custom + preview),
 | 8.1 | Open *Diagnostics* | Version, environment, storage keys, adapter catalog (site, auth style, limits, docs link) and saved servers |
 | 8.2 | Validate a profile, then open Diagnostics | This profile’s probe trace is listed: probe label, redacted URL, status, duration, interpretation |
 | 8.3 | **Copy diagnostics** | Clipboard contains a report; paste it and search for the API key **and** its last 4 characters → no matches |
-| 8.4 | Check the browser console for every flow above | No credential values, no unhandled errors |
+| 8.4 | Check the browser console, returned URLs, queue/history and Chrome Downloads using a fake Hydrus key | No key in generated URLs or logs; separately test Chrome Downloads header redirect/storage behavior as in 0c. |
 | 8.5 | Custom/fork host without host permission | Diagnostics shows the granted/permission-needed state, with a **Grant access** action |
 
 ## 9. Popup and page flow (real browser)
@@ -286,7 +368,7 @@ button falls back to the options page.
 | # | Steps | Expected |
 | --- | --- | --- |
 | 9.1 | Open a supported **post** page (e621/Danbooru/Gelbooru) in the active tab | Popup shows *This page* with the detected site, matching server (or an “add this site” prompt), and the post card |
-| 9.2 | Press **Download** | File saved with the configured naming; the popup reports the filename |
+| 9.2 | Press **Download** | Popup reports the start and filename; the queue tracks the Chrome completion or failure. Verify the file content separately. |
 | 9.3 | Press **Queue** | Item appears in the queue footer; *Start* runs it |
 | 9.4 | Open a **tag/search** page instead | Popup offers *Search these tags* against the matching server |
 | 9.5 | Open an unrelated page | Popup reports that the page is not a supported booru page, and offers the manager |
@@ -297,7 +379,7 @@ button falls back to the options page.
 | # | Steps | Expected |
 | --- | --- | --- |
 | 10.1 | Enable *Show the on-page download button* (Settings), open a post page | Floating “⬇ Download with Booru Manager” button appears (shadow DOM, page styles unaffected) |
-| 10.2 | Press it | Button text → *Downloading…* → success message with the filename |
+| 10.2 | Press it | Button shows *Downloading…*, then reports the browser start and filename, not completion. If the response is lost, check the queue and Chrome Downloads before trying again. |
 | 10.3 | Press it twice | Second press re-downloads (uniquified file) and reports accordingly |
 | 10.4 | Disable the setting and reload the page | Button no longer appears |
 | 10.5 | Open a post page from a host with no saved profile | Button reports that no server matches the page (link to the manager) |

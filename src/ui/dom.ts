@@ -1,5 +1,77 @@
 /** Minimal DOM helpers - no framework, no innerHTML for dynamic content. */
 
+const trackedDocuments = new WeakSet<Document>();
+const composingInputs = new WeakSet<EventTarget>();
+const deferredRenders = new WeakMap<EventTarget, () => void>();
+
+function trackComposition(document: Document): void {
+  if (trackedDocuments.has(document) || typeof document.addEventListener !== 'function') return;
+  trackedDocuments.add(document);
+  document.addEventListener('compositionstart', (event) => {
+    if (event.target) composingInputs.add(event.target);
+  }, true);
+  document.addEventListener('compositionend', (event) => {
+    const target = event.target;
+    if (!target) return;
+    composingInputs.delete(target);
+    // A final input event may follow compositionend and render a newer state.
+    queueMicrotask(() => {
+      const render = deferredRenders.get(target);
+      deferredRenders.delete(target);
+      render?.();
+    });
+  }, true);
+}
+
+/** Keep a text editor, its caret and IME composition stable during live re-renders. */
+export function preserveInputFocus(container: HTMLElement, render: () => void): void {
+  const document = container.ownerDocument ?? globalThis.document;
+  if (document) trackComposition(document);
+  const active = document?.activeElement as HTMLInputElement | HTMLTextAreaElement | null | undefined;
+  if (!active || typeof container.contains !== 'function' || !container.contains(active) ||
+      !['INPUT', 'TEXTAREA'].includes(active.tagName) || !active.matches('input:not([type=checkbox]):not([type=radio]), textarea')) {
+    render();
+    return;
+  }
+  if (composingInputs.has(active)) {
+    // Replacing a composing input would cancel the user's in-progress IME text.
+    deferredRenders.set(active, () => {
+      if (container.contains(active)) preserveInputFocus(container, render);
+    });
+    return;
+  }
+  deferredRenders.delete(active);
+  const id = active.id;
+  const name = active.getAttribute('name');
+  if (!id && !name) { render(); return; }
+  const tag = active.tagName;
+  const type = active.getAttribute('type');
+  const start = active.selectionStart;
+  const end = active.selectionEnd;
+  const direction = active.selectionDirection ?? undefined;
+  const scrollLeft = active.scrollLeft;
+  const value = active.value;
+  render();
+  const next = Array.from(container.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('input, textarea'))
+    .find((element) => element.tagName === tag && element.getAttribute('type') === type &&
+      (id ? element.id === id : element.getAttribute('name') === name));
+  if (!next || next.disabled) return;
+  // A storage response may normalize an incomplete value (e.g. an unfinished
+  // hostname or trailing space). Do not overwrite what is actively being typed.
+  if (next.value !== value && next.type !== 'file') {
+    const confirmedValue = next.value;
+    next.value = value;
+    next.addEventListener('blur', () => queueMicrotask(() => {
+      if (next.isConnected && document.activeElement !== next) next.value = confirmedValue;
+    }), { once: true });
+  }
+  next.focus({ preventScroll: true });
+  if (start !== null && end !== null) {
+    try { next.setSelectionRange(start, end, direction); } catch { /* Some input types do not support a selection. */ }
+  }
+  next.scrollLeft = scrollLeft;
+}
+
 export type Child = Node | string | number | null | undefined | false | Child[];
 
 export interface ElProps {

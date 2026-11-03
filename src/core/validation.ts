@@ -11,6 +11,7 @@ import type {
 import { isValidHttpUrl, safeUrl } from '../shared/util.js';
 import type { CredentialField, ProbeInterpretation, ValidationProbe } from './adapter.js';
 import { createAdapterContext, getAdapter } from './registry.js';
+import { requestRateKey } from './request-policy.js';
 
 const BROWSER_UA = /mozilla|chrome\/|safari\/|firefox\/|edge\//i;
 
@@ -88,6 +89,13 @@ export class ValidationService {
       });
     }
     const parsedBase = safeUrl(server.baseUrl);
+    if (parsedBase?.username || parsedBase?.password) {
+      return finish({
+        kind: 'incomplete-config', ok: false,
+        message: 'The server URL contains embedded credentials.',
+        warnings: ['Remove user information from the URL and use the profile credential fields instead.'],
+      });
+    }
     const loopback = parsedBase ? ['127.0.0.1', 'localhost', '[::1]'].includes(parsedBase.hostname) : false;
     if (parsedBase?.protocol === 'http:' && !loopback) {
       warnings.push('The base URL uses plain HTTP; credentials would travel unencrypted.');
@@ -108,7 +116,18 @@ export class ValidationService {
       warnings.push('No credentials saved - validating read-only access only.');
     }
 
-    const ctx = createAdapterContext(adapter, server, settings);
+    let ctx: ReturnType<typeof createAdapterContext>;
+    try {
+      ctx = createAdapterContext(adapter, server, settings);
+    } catch (error) {
+      const failure = error instanceof BooruError ? error : null;
+      return finish({
+        kind: failure?.kind ?? 'incomplete-config',
+        ok: false,
+        message: failure?.message ?? 'The server URL could not be normalized',
+        warnings: failure?.hint ? [failure.hint] : [],
+      });
+    }
     if (adapter.capabilities.requiresUserAgent && !server.customUserAgent.trim()) {
       warnings.push(`Using the generated User-Agent "${ctx.userAgent}" - add your own for the site's policy.`);
     }
@@ -128,6 +147,14 @@ export class ValidationService {
       });
     }
 
+    // Validation shares the same site/server budget and attempt setting as
+    // searches and post lookups. Otherwise probing can bypass rate limits.
+    const policy = {
+      rateKey: requestRateKey(server),
+      minIntervalMs: Math.max(settings.minRequestIntervalMs, adapter.capabilities.minRequestIntervalMs),
+      maxAttempts: settings.maxRetries,
+    };
+
     // -------------------------------------------------------- endpoint probes
     const endpointProbes = probes.filter((probe) => probe.purpose === 'endpoint' && probe.enabled !== false);
     if (!endpointProbes.length) {
@@ -138,7 +165,7 @@ export class ValidationService {
     let lastStatus: number | null = null;
 
     for (const probe of endpointProbes) {
-      const outcome = await this.runProbe(probe, trace);
+      const outcome = await this.runProbe(probe, trace, policy);
       lastStatus = outcome.snapshot?.status ?? null;
       onProgress?.({ probeId: probe.id, label: probe.label, ok: outcome.interpretation.ok, message: outcome.interpretation.message });
       if (outcome.interpretation.ok) {
@@ -169,7 +196,7 @@ export class ValidationService {
     let authFailure: ProbeInterpretation | null = null;
 
     for (const probe of authProbes) {
-      const outcome = await this.runProbe(probe, trace);
+      const outcome = await this.runProbe(probe, trace, policy);
       lastStatus = outcome.snapshot?.status ?? lastStatus;
       onProgress?.({ probeId: probe.id, label: probe.label, ok: outcome.interpretation.ok, message: outcome.interpretation.message });
       if (outcome.interpretation.ok) {
@@ -228,12 +255,13 @@ export class ValidationService {
   private async runProbe(
     probe: ValidationProbe,
     trace: ProbeTraceEntry[],
+    policy: { rateKey: string; minIntervalMs: number; maxAttempts: number },
   ): Promise<{ snapshot: HttpResponseSnapshot | null; interpretation: ProbeInterpretation }> {
     const request: HttpRequestSpec = { ...probe.request, timeoutMs: this.probeTimeoutMs };
     let snapshot: HttpResponseSnapshot | null = null;
     let interpretation: ProbeInterpretation;
     try {
-      snapshot = await this.http.request(request, { rateKey: `validate:${probe.purpose}`, minIntervalMs: 0 });
+      snapshot = await this.http.request(request, policy);
       interpretation = probe.interpret(snapshot);
     } catch (error) {
       const booruError = error instanceof BooruError ? error : null;
@@ -261,6 +289,7 @@ export class ValidationService {
 
   private hasCredentials(server: ServerConfig, authStyle: string): boolean {
     if (authStyle === 'query-with-userid') return !!(server.apiKey || server.userId);
+    if (authStyle === 'header' || authStyle === 'query') return !!server.apiKey;
     return !!(server.apiKey && (server.username || server.userId));
   }
 

@@ -37,6 +37,7 @@ export type UiRequest =
   | { type: 'servers/import'; payload: { json: string; includeSecrets?: boolean } }
   | { type: 'browse/search'; payload: { serverId: string | null; spec: SearchSpec } }
   | { type: 'posts/get'; payload: { serverId: string | null; postId: string } }
+  | { type: 'posts/thumbnail'; payload: { serverId: string; postId: string } }
   | { type: 'posts/resolveUrl'; payload: { url: string } }
   | { type: 'posts/download'; payload: { serverId?: string | null; postId?: string; url?: string } }
   | { type: 'routes/detect'; payload: { url: string } }
@@ -59,6 +60,7 @@ export type UiRequest =
   | { type: 'queue/list' }
   | { type: 'queue/enqueue'; payload: { items: EnqueueInput[] } }
   | { type: 'queue/enqueuePosts'; payload: { serverId: string; posts: EnqueueCandidate[] } }
+  | { type: 'queue/enqueuePawchivePost'; payload: { serverId: string; postId: string } }
   | { type: 'queue/enqueueLinks'; payload: { links: EnqueueLinkInput[]; serverId?: string | null } }
   | { type: 'queue/run'; payload?: { itemIds?: string[] } }
   | { type: 'queue/pause' }
@@ -102,6 +104,7 @@ export interface ResponseMap {
   'servers/import': { imported: number; skipped: number; errors: string[] };
   'browse/search': SearchResult;
   'posts/get': BooruPost;
+  'posts/thumbnail': { dataUrl: string };
   'posts/resolveUrl': { post: BooruPost; server: ServerConfigView; route: RouteMatch };
   'posts/download': { filename: string; post: BooruPost; viaFallback: boolean; downloadId: number | null };
   'routes/detect': (RouteMatch & { server: ServerConfigView | null }) | null;
@@ -133,6 +136,7 @@ export interface ResponseMap {
   'queue/list': { summary: QueueSummary; items: QueueItem[]; maxConcurrency: number };
   'queue/enqueue': { added: number; skipped: number; summary: QueueSummary };
   'queue/enqueuePosts': { added: number; skipped: number; summary: QueueSummary };
+  'queue/enqueuePawchivePost': { added: number; skipped: number; unavailable: number; summary: QueueSummary };
   'queue/enqueueLinks': { added: number; skipped: number; invalid: number; summary: QueueSummary };
   'queue/run': { started: boolean; summary: QueueSummary };
   'queue/pause': { summary: QueueSummary };
