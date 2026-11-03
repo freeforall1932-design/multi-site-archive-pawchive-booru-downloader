@@ -1,9 +1,9 @@
 /**
  * Adapter registration point.
  *
- * Adding a booru-like site is a single line here plus a new adapter module.
- * Nothing else in the codebase branches on site type - see
- * docs/ADAPTER_CONTRACT.md.
+ * Many booru-like sites can start with an adapter module and registration here.
+ * Site-specific permissions, UI and policy may also be needed; Pawchive already
+ * has explicit shared-service branches. See docs/ADAPTER_CONTRACT.md.
  *
  * Families shipped (mirroring what mature clients such as Droidbooru support,
  * see reference/README.md, minus dead or scrape-only sites):

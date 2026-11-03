@@ -78,14 +78,50 @@ Use files large/slow enough to observe the active state:
 5. Confirm clear/remove leaves in-flight rows tracked. Pause stops new starts, not
    existing Chrome transfers. Confirm that browser completion alone does not claim
    a hash or validate response contents.
+6. Force a lost worker message after a download starts and a storage failure after
+   an ID is accepted. Confirm no automatic replay or duplicate start; inspect the
+   queue and Chrome Downloads before any manual retry.
+7. Check validation and search respect the configured API-attempt count and
+   spacing; note that limiter state is lost on worker restart.
+
+## 0c. Hydrus and security checks (not yet performed in an installed extension)
+
+1. Use a **disposable, restricted** Hydrus key and a trusted direct local Client
+   API endpoint. Validate, search, view thumbnails and download one original;
+   confirm the key is in the header, not returned URLs, queue/history, browser
+   address bar, exported diagnostics or Chrome Download URLs. Check file bytes
+   independently. Repeat with a wrong key and insufficient permissions.
+2. With controlled test endpoints and a fake key, observe **Chrome Downloads**
+   custom-header behavior for same-origin and cross-origin redirects; also inspect
+   whether the browser stores request headers. Do not use a real key. Metadata and
+   thumbnail fetches should reject redirects. Ordinary-page fetch testing is not
+   evidence about Chrome Downloads.
+3. Seed legacy key-bearing Hydrus queue/history post URLs and restart the worker;
+   check their known key parameters are removed. Confirm mirror links and Mega
+   fragments are unchanged. Check Chrome Downloads/browser records and old exports
+   separately: they are not cleaned by this migration. Rotate any key previously
+   exposed by an older version.
+4. Disable queue thumbnails, queue Hydrus posts and mirror links, and delete a
+   post's profile: no thumbnail request should occur for those rows; a missing
+   profile should be marked and should not open an unknown post URL.
+5. Test User-Agent rewrite rules from extension and ordinary web-page requests,
+   including matching subdomains, before attempting initiator restrictions.
+6. Verify custom HTTPS and loopback HTTP permission prompts in real Chrome. Confirm
+   non-loopback HTTP is not silently treated as granted.
+7. In both profile editors, server filters, Browse ranges and Settings, type and
+   edit multiple characters, insert in the middle, and use an IME. Delay a settings
+   response while typing; newer text must survive. Panel edits autosave; options
+   drafts need Save. During a profile save its controls should be disabled. Check
+   failed validation blocks a normal save but **Save anyway** remains available.
+   Mock-preview keyboard tests passed, but real MV3 has not run.
 
 ## 1. Side panel [P]
 
-`[P]` = do this in the real browser (load `dist/` unpacked); the preview harness
-covers the same flow with mock data.
+`[P]` marks panel-specific checks. The preview covers many UI flows with mock
+data; only a real unpacked extension can verify Chrome APIs and browser behavior.
 
 1. Click the toolbar icon → the **side panel** opens next to the page. Status pill
-   reads *Ready*; the tab strip shows Browse · Queue · Servers · Settings.
+   reads *Ready*; the tab strip shows Browse · Queue · Links · Servers · Settings.
 2. **Context card.** Open `https://e621.net/posts/<id>` (or a mock URL in the
    harness) → the card names the matching profile and its route (`post #12345`).
    Press ⟳ with a non-booru tab active → the card says the page is not a supported
@@ -181,8 +217,9 @@ Then run the validation matrix. Expected *reason* text, not just red/green:
 | 3.8 | Site that returns 429/503 (e.g. validate e621 repeatedly, or `force:429` in the harness) | **Rate limited** — distinct message and hint, not auth/endpoint |
 | 3.9 | Credentials left blank entirely | Validation succeeds as a **read-only** profile with a warning |
 | 3.10 | e621 profile with a `Mozilla/5.0 … Chrome/…` User-Agent | Success plus a warning that a browser-like UA violates the site policy |
-| 3.11 | Plain `http://` base URL | Success plus a plain-HTTP warning |
-| 3.12 | Cancel while validation is running | UI returns to idle; no unhandled rejection in the console |
+| 3.11 | Non-loopback `http://` base URL | Preflight warns about plain HTTP; the manifest does not grant arbitrary non-loopback HTTP access, so the probe may fail. Loopback HTTP can be requested for a local client. |
+| 3.12 | Close the editor while validation is running | The editor closes; the already-started request is not guaranteed to be aborted. Check for an unhandled error. |
+| 3.12a | Base URL contains `user:password@` | Validation and save reject it before a network request; legacy views/exports mask it. |
 
 Form behaviour:
 
@@ -266,7 +303,7 @@ come back as one idle task.
 | 5b.5 | **Pause** while files are queued | The task's waiting files leave the queue, the card goes back to "n not downloaded" and the button says *Download missing* again; a download already running is not killed |
 | 5b.6 | Break one link's host (edit the row's URL in devtools, or import a list with a dead URL), then Download missing | Only that file fails; the card reads **partial - some files failed**, the file keeps its error text, and the next *Download missing* queues the failed file again (and never the saved ones) |
 | 5b.7 | **Rescan** a task that was collected already | "0 new post(s) scanned" — the second pass is incremental, it does not walk the creator again from scratch |
-| 5b.8 | Reload the panel and the browser | Task, files, statuses, run history and card expansion state survive (`bsm.tasks`, `bsm.links`) |
+| 5b.8 | Reload the panel and the browser | Task, files, statuses and run history survive (`bsm.tasks`, `bsm.links`); card expansion is in-memory UI state and may reset. |
 | 5b.9 | **Export package** | Two files download: `<name>_task.json` (manifest with `files` and `runs`) and `<name>_download_links.txt` (grouped list). Both open as plain text |
 | 5b.10 | Open the manifest in a text editor | Readable: `format`, `task` (id/name/site/service/creator), `summary` (total/done/failed/pending/completion), `files` (url, provider, post, status, filename) and `runs` |
 | 5b.11 | Harness page → **Reset preview data**, then Links tab → *Import package…* → pick the `.json` | One task comes back, **idle**, with the same name and file count; the notice reports how many were new vs already known; nothing downloads |
@@ -290,8 +327,9 @@ come back as one idle task.
 
 ## 7. Settings [V]
 
-The options page and the panel's Settings tab render the same sections; check one
-of each area rather than all of them twice: *Global behaviour* (toolbar mode),
+The options page and the panel's Settings tab render the same sections, but the
+panel autosaves edits while the options page keeps a draft until **Save settings**.
+Check one of each area rather than all of them twice: *Global behaviour* (toolbar mode),
 *Multiple download* (concurrency, spacing, retries, duplicates), *Mirror links*
 (filter, extra hosts, folder template), *List results*
 (media filter, page cap, queue rows, skip downloaded), *Search behaviour* (suffix,
@@ -318,7 +356,7 @@ blacklist, search history), *Name template* (checkboxes + custom + preview),
 | 8.1 | Open *Diagnostics* | Version, environment, storage keys, adapter catalog (site, auth style, limits, docs link) and saved servers |
 | 8.2 | Validate a profile, then open Diagnostics | This profile’s probe trace is listed: probe label, redacted URL, status, duration, interpretation |
 | 8.3 | **Copy diagnostics** | Clipboard contains a report; paste it and search for the API key **and** its last 4 characters → no matches |
-| 8.4 | Check the browser console for every flow above | No credential values, no unhandled errors |
+| 8.4 | Check the browser console, returned URLs, queue/history and Chrome Downloads using a fake Hydrus key | No key in generated URLs or logs; separately test Chrome Downloads header redirect/storage behavior as in 0c. |
 | 8.5 | Custom/fork host without host permission | Diagnostics shows the granted/permission-needed state, with a **Grant access** action |
 
 ## 9. Popup and page flow (real browser)
@@ -341,7 +379,7 @@ button falls back to the options page.
 | # | Steps | Expected |
 | --- | --- | --- |
 | 10.1 | Enable *Show the on-page download button* (Settings), open a post page | Floating “⬇ Download with Booru Manager” button appears (shadow DOM, page styles unaffected) |
-| 10.2 | Press it | Button text → *Downloading…* → success message with the filename |
+| 10.2 | Press it | Button shows *Downloading…*, then reports the browser start and filename, not completion. If the response is lost, check the queue and Chrome Downloads before trying again. |
 | 10.3 | Press it twice | Second press re-downloads (uniquified file) and reports accordingly |
 | 10.4 | Disable the setting and reload the page | Button no longer appears |
 | 10.5 | Open a post page from a host with no saved profile | Button reports that no server matches the page (link to the manager) |

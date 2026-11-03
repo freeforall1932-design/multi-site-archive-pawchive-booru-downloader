@@ -1,8 +1,8 @@
 # Worklist / status
 
-Status of the product scope, what is verified, and what is deliberately left for
-later. Last updated for `0.2.0` (side panel release) plus the mirror-link
-collector (`0.2.x`).
+Status of the product scope, what is verified, and what remains. Updated for
+version `0.2.0` and the 2026-11-03 audit. Most automated results are offline;
+installed-extension and live Hydrus/Pawchive checks remain outstanding.
 
 ## Delivered
 
@@ -26,67 +26,39 @@ collector (`0.2.x`).
 | Gelbooru 0.1.11 forks: rule34.xxx (auth required), safebooru.org, xbooru, tbib, hypnohub, realbooru | ✅ | `src/adapters/gelbooru-forks.ts` |
 | Moebooru family: yande.re, konachan (`/post.json`, optional `login`+`password_hash`) | ✅ | `src/adapters/moebooru.ts` |
 | Philomena family: derpibooru, furbooru, ponybooru (comma query syntax, ratings as tags, filter pinning) | ✅ | `src/adapters/philomena.ts` |
-| Hydrus Client API (local http, access key, two-step listing → metadata) | ✅ | `src/adapters/hydrus.ts` |
+| Hydrus Client API (local HTTP, access key, listing → metadata) | ⚠️ key-free URLs and header auth tested offline; Chrome Downloads header redirects/storage unverified | `src/adapters/hydrus.ts`, [SECURITY.md](SECURITY.md) |
 | Pawchive creator archive (indexed attachment slots, signed/classic originals, preview/deferred handling, all-files queue action) | ✅ offline | `src/adapters/pawchive.ts`, `src/core/router.ts` |
 | **Mirror-link collector (Links tab)**: walks a creator's posts, harvests the off-site download links in their bodies, keeps them in a durable list, groups/ticks/queues them, exports and re-imports the list as `.txt` | ✅ | `src/core/links.ts`, `src/core/link-store.ts`, `src/ui/panel-links.ts`, `src/panel/panel.ts`, [docs/SIDEPANEL.md#links-tab-download-tasks](SIDEPANEL.md#links-tab-download-tasks) |
-| **Download tasks**: one task per creator (site + service + creator), files joined to it, per-file outcome, completion states (complete/partial/failed/in-progress), run history, *Download missing* (new + retries, never re-download), *Pause*, *Rescan* (incremental) | ✅ | `src/core/tasks.ts`, `src/core/task-store.ts`, `bsm.tasks`, `tasks/*` in `src/core/router.ts` |
+| **Download tasks**: one task per creator (site + service + creator), per-file outcomes, run history, *Download missing* (new, failed, unverified; skips confirmed completions), *Pause*, *Rescan* | ✅ | `src/core/tasks.ts`, `src/core/task-store.ts`, `bsm.tasks`, `tasks/*` in `src/core/router.ts` |
 | **Task packages**: export writes the `.json` manifest *and* the grouped `.txt`; import reads either half (manifest, our `.txt`, a userscript export, a hand-written list) and merges into the existing task; nothing downloads on import | ✅ | `src/core/tasks.ts` (`formatTaskManifest`, `parseTaskPackage`), `src/core/router.ts` (`tasks/export`, `tasks/import`) |
 | Design record for the "torrent-like" behaviour: every option considered, what shipped, what is parked (hashes, pre-known sizes, task scheduling, a 6th tab) | ✅ | [docs/TASKS.md](TASKS.md) |
-| `link` queue rows: off-site URLs download without an adapter, a post lookup or a rating, keyed by URL so the same file is never queued twice | ✅ | `src/core/queue.ts` (`enqueueLinks`, `processLinkItem`, `syncLinkRow`) |
-| Standalone **Pawchive Link Collector** userscript shipped next to the extension (same rules, no extension needed) | ✅ | `userscripts/pawchive-link-collector.user.js`, `userscripts/README.md` |
-| Fixture tests for every added family from live-captured response shapes | ✅ | `tests/adapters/families.test.ts` |
+| `link` queue rows: off-site URLs download without an adapter, post lookup or rating; duplicate active/pending URLs are suppressed | ✅ | `src/core/queue.ts` (`enqueueLinks`, `processLinkItem`, `syncLinkRow`) |
+| Standalone **Pawchive Link Collector** userscript shipped next to the extension (separate HTML-based collector, no extension needed) | ✅ | `userscripts/pawchive-link-collector.user.js`, `userscripts/README.md` |
+| Fixture tests for added families | ✅ offline | `tests/adapters/families.test.ts`; Hydrus fixtures are based on API documentation, not a live local client |
 | Documented adapter contract | ✅ | `docs/ADAPTER_CONTRACT.md`, `src/core/adapter.ts`, conformance tests |
 | Shared services (servers, settings, validation, client, queue, naming, downloads, User-Agent rules, router) | ✅ | `src/core/*` |
 | Browsing, single-post download, batch queue | ✅ | `src/ui/browse.ts`, `src/ui/queue-view.ts`, `src/core/queue.ts` |
 | Popup + content-script download button | ✅ | `src/popup/popup.ts`, `src/content/post-button.ts` |
-| Diagnostics + credential-free traces | ✅ | `src/ui/diagnostics-view.ts`, `src/core/router.ts` |
+| Diagnostics + redacted request traces | ✅ with caveats | `src/ui/diagnostics-view.ts`, `src/core/router.ts`; unknown secret names and arbitrary site data still require care ([SECURITY.md](SECURITY.md)) |
 | Offline preview harness + mock booru | ✅ | `dev/preview/`, `src/preview/`, `scripts/preview-server.mjs` |
 | Tests for adapters and shared logic | ✅ | `tests/` — automated tests (incl. the mirror-link rules, the task/package round-trip and panel logic) |
 | Docs | ✅ | `README.md`, `docs/{SIDEPANEL,ARCHITECTURE,ADAPTER_CONTRACT,SECURITY,MANUAL_TESTS,WORKLIST}.md`, `userscripts/README.md` |
 
 ### Verification snapshot
 
-```
-npm run typecheck   → clean (src + tests, strict TS, noUncheckedIndexedAccess)
-npm test            → offline adapter, core and panel suites pass
-npm run build       → dist/ with manifest, 4 icons, build-info.json
-npm run smoke       → 94/94 checks against the built dist/ bundle (incl. booting
-                      the built panel bundle, driving a query and a full
-                      mirror-link collection through it, walking all five panel
-                      tabs incl. Links, exporting a task package and reading it
-                      back, and booting the options bundle)
-npm run preview     → harness + side panel/options/popup served on :4173, with a
-                      demo creator whose posts carry mirror links
-```
+Audit verification on 2026-11-03: `npm run verify` passed strict typechecking,
+build, **595/595 tests** and **96/96 built-bundle smoke checks**. `npm audit`
+reported **0 vulnerabilities** and `git diff --check` was clean.
 
-| Suite | Tests | Focus |
-| --- | --- | --- |
-| `tests/adapters/contract.test.ts` | 131 | cross-adapter invariants, automatically covers new adapters (incl. Pawchive) |
-| `tests/adapters/families.test.ts` | 25 | Moebooru, Philomena, Hydrus and Gelbooru fork fixtures |
-| `tests/adapters/pawchive.test.ts` | 12 | Pawchive hosts, URLs, attachment shapes, signatures and availability |
-| `tests/core/pawchive-scope.test.ts` | 16 | legacy profiles, retained boorus, task scope, text-only posts, pacing and preview history |
-| `tests/core/preview-media.test.ts` | 2 | local-only mock thumbnails and downloads |
-| `tests/adapters/e621.test.ts` | 26 | auth, requests, parsing, failure classification, routes, UA |
-| `tests/adapters/danbooru.test.ts` | 17 | same, plus `/profile.json` account parsing |
-| `tests/adapters/gelbooru.test.ts` | 24 | DAPI envelope, query-with-userid auth, fork factory |
-| `tests/core/router.test.ts` | 35 | entire message protocol end-to-end against the mock APIs |
-| `tests/core/links.test.ts` | 30 | link rules, payload extraction, export/import round-trip, store merge rules, `link` rows, the `links/*` flow |
-| `tests/core/tasks.test.ts` | 23 | task identity, statistics/completion, run planning, the package round-trip between two machines, pause/rescan, run history |
-| `tests/core/panel-core.test.ts` | 35 | page ranges, query composition, template editor, history notebooks, panel settings keys |
-| `tests/core/panel-router.test.ts` | 12 | selective runs, history/search messages, blacklist + suffix, legacy quality migration |
-| `tests/core/original-only.test.ts` | 25 | original vs sample selection across booru families, direct/queue paths, legacy settings/history |
-| `tests/core/pawchive-all-files.test.ts` | 6 | post all-file queueing, unavailable slots, changed hashes and old indices |
-| `tests/core/mega-links.test.ts` | 8 | keys, task/queue identity, exports, known share pages and redaction |
-| `tests/core/http.test.ts` | 27 | rate limiter, retries, abort, redaction, JSON/HTML/empty bodies |
-| `tests/core/queue.test.ts` | 13 | dedupe, rating enforcement, failures, pause/retry/clear, persistence |
-| `tests/core/download-completion.test.ts` | 22 | delayed completion, interruption, ID races, worker recovery, progress, cancellation, tasks, legacy records and MV3 listener wiring |
-| `tests/core/servers.test.ts` | 19 | CRUD, default rules, duplicate, masking, export/import |
-| `tests/core/validation.test.ts` | 19 | preflight, endpoint/auth/rate-limit/network classification, trace redaction |
-| `tests/core/naming.test.ts` | 17 | sanitisation, traversal, reserved names, tokens, length caps |
-
-All tests run offline against `src/preview/mock-booru.ts`; no live site is contacted
-by the suite. `docs/MANUAL_TESTS.md` is a plan, not proof that live Pawchive
-has been tested for these changes.
+The offline suites cover adapters, original-only selection, Pawchive attachment
+identity, Mega links, queue completion/recovery and bookkeeping, message transport,
+request policy, security redaction, tasks, UI logic and preview-server access. One
+suite starts a local preview HTTP server; no live external service is contacted.
+A separate HeadlessChrome **mock-preview** check exercised multi-character typing,
+caret insertion, synthetic composition events, filtering, delayed settings saves,
+and profile validation/save controls. It was not an installed extension test.
+[MANUAL_TESTS.md](MANUAL_TESTS.md) remains a plan, not evidence of a live Chrome
+extension, Hydrus or Pawchive run.
 
 ## Behaviour notes worth knowing
 
@@ -125,38 +97,53 @@ has been tested for these changes.
   history (when, how many posts, how many added/queued/saved/failed). "Complete /
   partial / failed" is computed from those records, never inferred from the
   filesystem.
-- **Storage writes are serialised.** `MirrorLinkStore` and `TaskStore` chain their
-  mutations: two concurrent queue workers settling two files used to race on a
-  read-modify-write of the whole list and lose one status change (found by the
-  task tests, fixed in `src/core/link-store.ts`).
+- **Store writes are serialised within the worker.** Server, settings, link, task,
+  download-history and search-history mutations chain their read-modify-writes,
+  preventing concurrent operations on the same store instance from losing each
+  other's updates. This is not a cross-process transaction or a guarantee against
+  storage-quota failures. Multiple open UI drafts can still overwrite one another.
 
-- **Exactly one default** profile always exists once at least one server is saved
-  (first save wins, deleting the default promotes the next row).
+- **One usable default** is selected when a usable profile exists (first save
+  wins, deleting the default promotes another). Unsupported or invalid legacy
+  profiles are retained for recovery but cannot be used as defaults.
 - **Rating filter is three-layered**: profile allow-list (stored), shared decision
   layer (`BooruClient.isRatingAllowed` / `ratingFilterFor`), site spelling in the
   adapter. Queueing filters, and single downloads filter when
   *Settings → Enforce rating filter on download* is on.
-- **Validating a draft reuses stored secrets** when the key field is left blank, so
-  “edit → validate” does not require re-typing a key.
+- **Validating a draft reuses stored secrets only for the same connection** when
+  the key field is blank. Changing the site or endpoint requires re-entering the
+  key or clearing credentials; stale validation results do not authorize a save.
 - **The queue is stateful across restarts**: running browser IDs are reconciled
   against Chrome, and the persisted selection can resume dispatch. A running row
   without an ID is unverified rather than silently restarted. Old start-only done
   rows and history are also unverified. Active rows cannot be removed or cleared.
 - **e621 User-Agent**: custom UA → `declarativeNetRequest` header rewrite →
   `_client` query parameter fallback (`sendClientParam` setting).
-- **Rate limiting** is per saved server, defaulting to 1 request/second plus the
-  adapter's documented minimum; the HTTP layer also retries 429/5xx with backoff
-  and honours `Retry-After`.
+- **API rate limiting** is per saved server, defaulting to 1 request/second plus
+  the adapter's minimum; Pawchive shares a budget across its profiles. Validation,
+  search and post lookup use the same budget. Configured API attempts include the
+  initial request; transient errors use backoff and `Retry-After`. Limiter state
+  is in memory and resets on worker restart.
 
-## Known gaps / deliberate non-goals (0.1.0)
+## Known gaps / deliberate non-goals
 
 | Gap | Notes / plan |
 | --- | --- |
-| Read-only product | No uploads, favourites, pool edits or tag edits. The adapters expose only read endpoints plus the vote/favourite helpers that are not yet surfaced in the UI. |
+| **Hydrus download-header and redirect risk** | New URLs are key-free; metadata/thumbnails reject redirects and original downloads pass a transient header after exact-target validation. Chrome Downloads redirect handling and header storage, and a live Hydrus client, remain untested. Use a trusted direct endpoint and restricted key; rotate previously exposed keys and clean old browser records. See [SECURITY.md](SECURITY.md). |
+| **User-Agent rule scope is broad** | DNR `requestDomains` includes subdomains and has no initiator restriction. Test a safe extension-only restriction in Chrome before changing it. |
+| **No live Chrome/Pawchive validation yet** | Exercise MV3 start/completion, interruption, cancellation, worker restart, permissions, originals, all-file selection and Mega export against permitted test data. See [MANUAL_TESTS.md](MANUAL_TESTS.md). |
+| **Pacing resets on worker restart** | Pawchive metadata and file-start limiters are in memory; persist or otherwise coordinate budgets across restarts if strict continuity is required. Other applications and multiple booru profiles are not globally coordinated. |
+| **MV3 blob fallback is unavailable** | Service workers lack `URL.createObjectURL`; a failed direct browser start is surfaced instead. Evaluate an offscreen-document fallback only if needed and test authentication, permissions and cleanup. |
+| **Multiple UI editors** | Mutations are serialized within a store/UI instance, but separate open options/panel drafts are not a cross-context transaction; one can overwrite another. Investigate revision-based conflict detection. |
+| **Hydrus thumbnail cache after credential changes** | Already fetched thumbnails can remain in the page's bounded in-memory cache until eviction or reload, including after a key is changed/revoked in another view. Investigate cross-view cache invalidation; close/reopen the UI if immediate removal matters. |
+| **Settings write volume** | Panel text edits currently save serially per input and each save can resync User-Agent rules. Investigate safe coalescing/debouncing without dropping the final edit on panel close. |
+| **Large-state scalability** | Queue/progress and related stores rewrite serialized lists; Chrome local-storage quota and UI/worker load can limit large collections despite row caps. Benchmark, handle quota exhaustion and consider a transactional/paged store. |
+| **Uncertain message outcomes** | Mutation responses can be lost after execution; no replay is attempted. Users must inspect state and Chrome Downloads before retrying. A stronger idempotency protocol is future work. |
+| Read-only product | No uploads, favourites, pool edits or tag edits are exposed in the UI. |
 | No tag autocomplete | Would need a per-site tag endpoint; `supportsTagSearch` capability is already declared. |
 | Pools/forks browsing | `matchRoute` recognises pool URLs, but no pool listing UI yet. |
 | No downloaded-content integrity check | Chrome reports transfer state and byte progress, but the extension does not hash saved files or detect every HTML/error response, and files can later be moved or deleted. |
-| No bulk “download whole search” | Queueing is per page; “queue all loaded” covers the current listing. |
+| No unlimited whole-search archive | The panel can fetch a page range and queue loaded rows, but one crawl is capped by the page-limit setting and does not guarantee a complete archive. |
 | Live network tests are not automated | `npm run smoke` uses an offline mock; Pawchive has not been live-tested for the current changes. |
 | Chrome/Edge/Brave only | Built on `chrome.*` MV3 APIs. Firefox would need a `browser.*` shim and manifest tweaks. |
 | No i18n | All strings are English literals in the view layer. |
@@ -168,23 +155,20 @@ has been tested for these changes.
 
 ## Next steps (suggested order)
 
-1. **Download-integrity pass**: design byte/hash verification of completed files
-   where Chrome permissions and the site's metadata permit it. Completion tracking
-   is implemented, but `onChanged` does not stream bytes: the panel polls
-   `chrome.downloads.search()` for browser-reported progress.
-2. **Archive picture packing** (ZIP/CBZ/PDF per post, offscreen document) as an
-   optional output mode in the panel's settings, mirroring the Rule 34 picture
-   modes.
-3. **Tag autocomplete + favourites/history browsing** using the sites' tag and
-   favourites endpoints, behind the existing capability flags (Anime Boxes parity).
-4. **Zip packaging + CI**: build artifact upload, `npm run verify` as a workflow,
-   a version-bump script.
-5. **Exclude the preview modules from release builds** (build flag) and ship a
-   `dist-preview` variant for the harness.
-6. **Pool/favourites browsing** for e621/Danbooru (adapters already recognise the
-   routes; the UI needs a second listing mode).
-7. **More adapters**: register common DAPI forks via `createGelbooruLikeAdapter`
-   and add a first-class adapter for a Danbooru-style instance to validate that the
-   contract scales beyond the three targets.
-8. **Firefox/Manifest parity pass** if a second browser target is required
-   (the side panel has no Firefox equivalent, so the popup fallback earns its keep).
+1. **Hydrus real-browser security validation:** with disposable keys and controlled
+   endpoints, test Chrome Downloads custom-header forwarding on redirects and header
+   retention, plus live Hydrus search, thumbnails and originals. Finish rotation and
+   manual cleanup of old browser records. Until then, use a trusted direct endpoint.
+2. **Real-browser and live-site checks:** run the unperformed cases in
+   [MANUAL_TESTS.md](MANUAL_TESTS.md), including typing/IME in the extension,
+   permission prompts, Chrome completion/restart races, originals and
+   available/deferred Pawchive attachments.
+3. **User-Agent scope and pacing:** investigate extension-only DNR initiators and
+   rate-budget continuity across worker restarts; validate Chrome behavior.
+4. **Integrity and reliability:** research byte/hash verification, large-queue
+   storage limits, explicit mutation idempotency and any MV3-safe blob fallback.
+5. **Optional product work:** archive picture packing (ZIP/CBZ/PDF), tag
+   autocomplete, pool/favourites browsing, and provider-specific link resolution.
+6. **Release/portability:** automated packaged artifacts and CI, excluding preview
+   modules from release builds, and Firefox support if requested. Any additional
+   adapters must remain within the product's Pawchive-only creator-archive scope.

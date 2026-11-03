@@ -1,158 +1,134 @@
 # Security & privacy notes
 
-This extension handles booru API keys. This document is the contract for how those
-keys are stored, transmitted, displayed, logged and removed. The short version:
-**keys live in `chrome.storage.local`, are sent only to the host you configured
-them for, are never rendered or logged in the clear, and can be deleted per
-profile at any time.**
+This extension stores API credentials and may collect private share URLs. It has
+no application backend or analytics, but it does contact the configured sites,
+remote thumbnail hosts and any file hosts you explicitly download from. Use a
+trusted browser profile and review the limitations below before handling secrets.
 
-## 1. Where credentials are stored
+## Important: Hydrus authentication and remaining risks
+
+New Hydrus post, original-file and thumbnail URLs are constructed **without** an
+access key. Authenticated metadata, validation and thumbnail requests use the
+`Hydrus-Client-API-Access-Key` header and reject redirects. A thumbnail request
+accepts only a saved profile ID and numeric file ID, not an arbitrary URL; the
+worker caps its image response. These paths have offline tests but have **not**
+been verified against a live Hydrus client or an installed MV3 extension.
+
+Original downloads pass the key as a transient custom header to
+`chrome.downloads.download` only after checking the exact configured file endpoint
+and file ID. **Chrome Downloads' treatment of custom headers on redirects and in
+browser storage has not been verified.** A local ordinary-page fetch experiment
+showed a custom header can be forwarded to another origin when redirects are
+followed; it did not test Chrome Downloads. Use a trusted direct endpoint that does
+not redirect, avoid untrusted proxies, and use a narrowly restricted key. Do not
+assume the browser never retains the header. See [WORKLIST.md](WORKLIST.md) and
+[MANUAL_TESTS.md](MANUAL_TESTS.md) for the pending real-browser checks.
+
+Older versions placed the key in URLs. On worker startup/reading, known Hydrus
+key parameters are removed from non-link queue post URLs and download-history
+post URLs. Mirror-link URLs are intentionally left intact. This migration does
+not clean Chrome Downloads, browsing history, exports, logs, backups, or arbitrary
+other stored text. Revoke/rotate any previously exposed key and manually inspect
+and remove old browser download/history records and exports as appropriate.
+
+## 1. Data at rest
 
 | Data | Location | Notes |
 | --- | --- | --- |
-| API keys, usernames, user ids, custom User-Agents | `chrome.storage.local` → key `bsm.servers`, inside the `ServerConfig` records | Never `chrome.storage.sync`, so keys are not uploaded to a Google account and do not travel between devices |
-| Settings (templates, toggles, intervals) | `chrome.storage.local` → `bsm.settings` | No secrets here |
-| Queue state | `chrome.storage.local` → `bsm.queue` | Post ids and statuses; link rows also retain complete external URLs, potentially including share keys |
-| Collected links and task membership | `chrome.storage.local` → `bsm.links`, `bsm.tasks` | Link URLs can contain bearer tokens or decryption keys, including Mega fragments |
-| Schema/meta (version, first run) | `chrome.storage.local` → `bsm.meta` | No secrets |
+| Server API keys, usernames, user IDs, custom User-Agents | `chrome.storage.local` → `bsm.servers` | Not `chrome.storage.sync`; profiles are not encrypted by the extension. |
+| Settings | `bsm.settings` | Templates and other user-entered values can themselves be sensitive. |
+| Queue and download history | `bsm.queue`, `bsm.history` | Include post URLs; link rows retain full off-site URLs. Legacy Hydrus key parameters in post URLs are migrated on read, not in external records or exports. |
+| Search history | `bsm.searches` | Stores searches, which may reveal user interests or private data. |
+| Collected links and tasks | `bsm.links`, `bsm.tasks` | Link URLs and exports may contain bearer tokens or Mega decryption fragments. |
 
-`chrome.storage.local` is readable by this extension only (not by web pages), and
-is protected by the browser profile — anyone who can read your browser profile
-files can read the keys. Treat a machine with a shared or compromised browser
-profile as unsuitable for storing API keys.
+Browser extensions cannot normally read another extension's storage, but anyone
+with access to the browser profile files or a compromised profile may recover
+these values. Internal worker memory and caches may hold raw credentials and API
+responses while needed; no fixed in-memory retention time is guaranteed.
 
-Keys are held in service-worker memory only for the duration of a request and are
-never written to disk anywhere else (no IndexedDB, no cache, no remote service).
+New server URLs containing `user:password@` are rejected. Legacy profiles with
+embedded URL credentials remain stored for recovery/export, but are not usable
+for requests or as defaults until edited. Server views and default server exports
+redact those embedded credentials; the explicit secret-inclusive export preserves
+them. Deleting keys from credential fields does not automatically scrub old
+URLs, queue/history rows, share URLs or browser history.
 
-## 2. Where credentials are transmitted
+## 2. Network and permissions
 
-Only to the host of the server profile that owns them, and only over HTTPS:
+- API requests use the configured server and site-specific authentication.
+  Some sites put credentials in query parameters; configured HTTP endpoints
+  transmit them without TLS. Redirects, proxies, the remote server and browser
+  histories are outside the extension's confidentiality guarantee.
+- Built-in `host_permissions` cover the listed booru and Pawchive HTTPS hosts.
+  Custom HTTPS access can be requested through `optional_host_permissions:
+  https://*/*`. The manifest also permits optional `http://127.0.0.1/*` and
+  `http://localhost/*` for local clients such as Hydrus; it does **not** grant
+  arbitrary non-loopback HTTP host permissions. Plain HTTP validation warns about
+  exposure and may also fail for lack of an allowed permission.
+- Chrome performs requested file downloads, including off-site direct links.
+  The extension does not resolve provider share pages or verify file contents.
+- UI `<img>` elements for non-Hydrus sites can request preview URLs supplied by
+  sites, including CDN or other hosts. Hydrus thumbnails use an authenticated
+  worker fetch and an in-memory image cache. Disabling queue thumbnails reduces
+  some requests but is not a universal thumbnail-off switch for every surface.
+- `storage`, `downloads`, `declarativeNetRequest`, `activeTab` and `sidePanel`
+  support local state, browser transfers, User-Agent rules, active-page detection
+  and the panel. Review the actual host patterns in `src/manifest.json`.
 
-- `https://<baseUrl>/...` requests issued by the service worker (or, in the
-  preview harness, by the mock booru in the page — no real traffic).
-- Authentication style is the one the site documents:
-  e621/Danbooru use `Authorization: Basic base64(username:apiKey)` (or
-  `login`/`api_key` query parameters), Gelbooru uses `api_key` + `user_id`
-  query parameters.
-- Plain-HTTP base URLs validate with a warning; nothing prevents you from using
-  one, but credentials would then travel unencrypted. Prefer the documented
-  HTTPS URLs.
+## 3. Views, exports and diagnostics
 
-There is **no remote backend**: the extension never sends data to any server other
-than the booru hosts you configure, and it contains no telemetry, analytics or
-update pings.
+- Server profile views omit `apiKey`, exposing a mask and `hasApiKey` instead.
+  The editor holds typed credentials in its draft state. Generated Hydrus URLs
+  no longer include the access key, but full mirror-link URLs and other returned
+  site data can contain secrets and are **not** guaranteed credential-free.
+- Server exports omit API keys and redact embedded URL credentials by default.
+  The explicitly opted-in secret-inclusive export is plaintext. Collected-link
+  and task exports intentionally retain complete share URLs and their fragments;
+  only share them with people you trust.
+- `redactUrl()` masks known sensitive query parameter names case-insensitively,
+  URL userinfo, Pawchive signed `s` values and fragments. Unknown credential names
+  or secrets outside URL-shaped text can still escape generic redaction. The
+  validation trace uses redacted request URLs; diagnostic server URLs are also
+  redacted. Review reports before sharing.
+- `HttpClient` emits redacted diagnostic events and supplies `redactedUrl`, but
+  its internal `HttpResponseSnapshot.url`, response headers and body are **raw**.
+  They are not safe to render, log or persist without appropriate sanitization.
+  `redactHeaders()` is available for request descriptions. Adapter errors and
+  user-generated labels also require care; do not assume arbitrary text is safe.
 
-## 3. What the UI may show
+## 4. User-Agent rules and page scripts
 
-- All servers cross into the UI as `ServerConfigView`, which has **no `apiKey`
-  field** — only `apiKeyMask` (e.g. `••••••••4f2a`, last four characters) and the
-  boolean `hasApiKey`.
-- Password fields keep their value only in the editor's local draft state while you
-  are typing. Saving with a blank key keeps the stored key (masked edit semantics).
-- Diagnostics show *booleans and statuses*, never key material, and the copied
-  report contains no secrets.
-- Export excludes secrets by default. `Export with secrets` requires an explicit
-  checkbox and carries a warning in the UI, because the resulting file is a plain
-  JSON file outside the extension's control.
+Dynamic `declarativeNetRequest` rules rewrite `User-Agent` for
+`xmlhttprequest` requests to configured `requestDomains`. Chrome's domain match
+includes subdomains; the current rules do **not** restrict the request initiator,
+so matching requests outside the extension may be affected as well. Disable
+*User-Agent rewriting* if that scope is unacceptable. Restricting initiators
+without breaking extension fetches is an open item requiring real-browser tests.
+The configured User-Agent appears in the browser's dynamic rules: never put API
+keys in that field.
 
-## 4. Logging and diagnostics rules
+The manifest injects the content script on its listed post URL patterns. It reads
+the page URL and communicates with the worker during detection and on button
+clicks. Shadow DOM isolates styling; it is not a security boundary and does not
+prevent a content script from accessing page DOM.
 
-These are hard rules for the codebase (any change that breaks them is a bug):
+## 5. Removing data and using preview safely
 
-1. No credential value is ever passed to `console.*`. Errors are surfaced as
-   `BooruError` messages that are built from redacted URLs.
-2. `HttpClient` snapshots and events are redacted at the source:
-   `redactUrl()` replaces the values of `api_key`, `apikey`, `key`, `login`,
-   `password`, `password_hash`, `token`, `access_token`, `user_id` and `_client`
-   with `***`, masks Pawchive signed `s` values and URL fragments, and strips any
-   `user:password@` userinfo. `redactHeaders()` masks
-   `Authorization`, `Cookie`, `X-API-Key`.
-3. Validation results carry a redacted `trace` (`ProbeTraceEntry`) with the
-   redacted request URL, status, duration and interpretation — that trace is what
-   the diagnostics tab shows and what is persisted on the profile.
-4. The queue records post ids, filenames and error kinds; error text comes from
-   the adapter and never includes credentials.
+- Clear a profile's credential fields or delete the profile; revoke the key at the
+  service if exposure is suspected. Also inspect/clear queue, download history,
+  saved exports and browser history where credential-bearing URLs could remain.
+- Remove site permissions in the browser's extension settings and uninstall or
+  clear extension data if you want to remove local extension storage.
+- The offline preview uses in-page mocks and `localStorage`. Use demo credentials
+  only. Clicking an external link can still open a real site.
+- `npm run preview` listens on `0.0.0.0` without authentication and serves the
+  built extension, harness and mock media. It does not serve arbitrary repository
+  files, but should still be run only on a trusted network and stopped when done.
 
-## 5. Permissions and why they are needed
+## 6. Reporting a problem
 
-| Permission | Reason |
-| --- | --- |
-| `storage` | Persist server profiles, settings and the queue |
-| `downloads` | Save post files through the browser's download manager |
-| `declarativeNetRequest` | Rewrite the `User-Agent` header for API requests to saved hosts (e621/Danbooru policies require a descriptive, non-browser UA, which `fetch` cannot set) |
-| `activeTab` | The popup reads the current tab's URL to detect the site/post |
-| Host permissions (`e621.net`, `e926.net`, `*.e621.net`, `*.donmai.us`, `danbooru.donmai.us`, `gelbooru.com`, `www.gelbooru.com`, `*.gelbooru.com`) | Talk to the documented APIs of the supported sites |
-| `optional_host_permissions: https://*/*` | Only requested when you add a custom/fork instance; requested on demand via `chrome.permissions.request` and revocable from `chrome://extensions` |
-
-User-Agent rewriting rules are scoped to `resourceTypes: ['xmlhttprequest']` and
-to the exact hosts of your saved servers. They are rebuilt from the saved profiles
-on every settings/server change, and removed entirely when
-*Settings → User-Agent rewriting* is switched off.
-
-The content script only runs on post pages (`/posts/*` on e621/e926/donmai,
-`index.php*` on Gelbooru) and only sends the page URL to the service worker when
-you click its button. It renders inside a shadow root, so it cannot read or alter
-the page's own DOM script state.
-
-## 6. Removing stored credentials
-
-| Goal | How |
-| --- | --- |
-| Remove one profile's keys, keep the profile | *Servers → Edit → Clear credentials* (or the same action from the list) |
-| Remove a profile entirely | *Servers → Delete* (the profile, including its keys, is deleted from storage) |
-| Remove everything | Uninstall the extension, or clear extension data in `chrome://extensions` → *Details → Site access / Clear data*; you can also delete the `bsm.*` keys from the extension's `chrome.storage.local` in a DevTools console |
-| Remove a granted host permission | `chrome://extensions` → *Details → Site access* |
-| Clear the preview harness | The harness page's **Reset preview data** button deletes the `bsm-preview:*` `localStorage` keys |
-
-## 7. Threat model and known limitations
-
-- **Trusted browser profile required.** Anything running with access to your
-  profile (another extension with broad permissions, a person with your unlocked
-  computer) can read `chrome.storage.local`. Use scoped keys where the site offers
-  them, and delete profiles you no longer use.
-- **Keys are bearer credentials.** A leaked key grants the account's API access but
-  not your password. Revoke it on the site first if you suspect exposure.
-- **No secret-sync.** Because storage is local-only, a fresh profile/device has no
-  servers; use *Export* (without secrets) for layout and re-enter keys manually.
-- **`declarativeNetRequest` rules are visible** to the browser as dynamic rules and
-  echo the configured User-Agent strings. Those strings identify the account you
-  configured, which is exactly what e621/Danbooru policy asks for; keep API keys out
-  of the User-Agent field.
-- **Exported files are outside our control.** A server export including credentials
-  is plaintext. Collected-link text and task exports intentionally preserve full
-  URLs, including Mega decryption keys and other bearer tokens, even when server
-  credentials are excluded; share and store those packages carefully.
-- **The preview harness is development-only.** It uses demo credentials and
-  `localStorage`; never put real keys into it.
-- **Site terms still apply.** The extension enforces documented request rates and a
-  descriptive User-Agent, but you are responsible for how you use the content you
-  download.
-
-## 8. Reporting a problem
-
-If you find a path where a key can leak into logs, the rendered UI, an export or a
-diagnostics payload, treat it as a security bug: fix it at the source (redaction
-helpers in `src/shared/util.ts` and the response shaping in `src/core/router.ts`)
-and add a regression test alongside the existing masking tests in
-`tests/core/router.test.ts` and `tests/core/http.test.ts`.
-
-## Side panel
-
-The panel is a full UI surface but no new trust: it is an extension page with the
-same origin as the options page, so it uses the same message-only channel to the
-worker as every other surface.
-
-- It contains no credentials - server rows arrive already masked (`apiKeyMask`,
-  `hasApiKey`) and export/import flows to the options page, which owns the reveal
-  and export controls.
-- It performs no network I/O: fetches go through `browse/search` (which applies the
-  rating allow-list and the booru tag blacklist in the router (Pawchive has neither)) and downloads through the
-  queue.
-- The download notebook (`bsm.history`) stores labels, ids, filenames, byte counts
-  and timestamps - never URLs with credentials, never API keys. `Reset download
-  history` removes it without touching files on disk.
-- `chrome.sidePanel.open` is only callable from a user gesture; the panel falls
-  back to opening the options page when the API refuses, so a mis-configured
-  profile can never dead-end the user.
-- Post thumbnails are drawn from the sites' own preview URLs (no third-party
-  host); *Settings → Interface → Post thumbnails* switches them off.
+Treat any unexpected secret in a UI response, log, error, export or diagnostics
+payload as a security defect. Include a minimal reproduction with fake credentials;
+never publish real keys, signed URLs or private share links. Add regression tests
+near the relevant router, adapter, HTTP or storage code and document any residual
+risk rather than assuming redaction is complete.

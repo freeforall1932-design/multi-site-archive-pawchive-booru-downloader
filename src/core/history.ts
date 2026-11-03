@@ -8,10 +8,11 @@
  *  - **Search history** (`bsm.searches`): the last few queries per server, shown
  *    as suggestions under the panel's search box.
  *
- * Both are plain storage-backed lists: no credentials, no post payloads, only
- * ids/labels a user could read in the UI anyway.
+ * Both are storage-backed lists. History includes post URLs; search queries can
+ * also be sensitive. Old Hydrus key-bearing post URLs are cleaned on read.
  */
 import type { DownloadHistoryEntry, SearchHistoryEntry } from '../shared/types.js';
+import { stripHydrusCredentials } from '../shared/util.js';
 import { STORAGE_KEYS, type StorageArea } from './storage.js';
 
 /** Hard ceiling so a long-lived profile cannot grow the store without bound. */
@@ -35,6 +36,7 @@ function isHistoryEntry(value: unknown): value is DownloadHistoryEntry {
  */
 export class DownloadHistoryStore {
   private cache: DownloadHistoryEntry[] | null = null;
+  private loadPromise: Promise<void> | null = null;
   private chain: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly area: StorageArea) {}
@@ -47,11 +49,24 @@ export class DownloadHistoryStore {
 
   async list(): Promise<DownloadHistoryEntry[]> {
     if (!this.cache) {
-      const stored = await this.area.get<unknown>(STORAGE_KEYS.history);
-      const entries = Array.isArray(stored) ? stored.filter(isHistoryEntry) : [];
-      this.cache = entries;
+      if (!this.loadPromise) {
+        this.loadPromise = (async () => {
+          const stored = await this.area.get<unknown>(STORAGE_KEYS.history);
+          let changed = false;
+          const entries = (Array.isArray(stored) ? stored.filter(isHistoryEntry) : []).map((entry) => {
+            const postUrl = stripHydrusCredentials(entry.postUrl ?? '');
+            if (postUrl !== entry.postUrl) changed = true;
+            return { ...entry, postUrl };
+          });
+          // Finish the privacy migration before exposing the rows or accepting
+          // concurrent mutations; a failed write is retried on the next read.
+          if (changed) await this.area.set(STORAGE_KEYS.history, entries);
+          this.cache = entries;
+        })().finally(() => { this.loadPromise = null; });
+      }
+      await this.loadPromise;
     }
-    return this.cache.map((entry) => ({ ...entry }));
+    return (this.cache ?? []).map((entry) => ({ ...entry }));
   }
 
   async size(): Promise<number> {
@@ -77,9 +92,10 @@ export class DownloadHistoryStore {
     return this.serialize(async () => {
       const entries = await this.list();
       const next = entries.filter((existing) => existing.key !== entry.key);
-      next.unshift({ ...entry });
-      this.cache = next.slice(0, MAX_HISTORY_ENTRIES);
-      await this.area.set(STORAGE_KEYS.history, this.cache);
+      next.unshift({ ...entry, postUrl: stripHydrusCredentials(entry.postUrl ?? '') });
+      const saved = next.slice(0, MAX_HISTORY_ENTRIES);
+      await this.area.set(STORAGE_KEYS.history, saved);
+      this.cache = saved;
     });
   }
 
@@ -87,9 +103,10 @@ export class DownloadHistoryStore {
     return this.serialize(async () => {
       const key = historyKey(serverId, postId);
       const entries = await this.list();
-      this.cache = entries.filter((entry) => entry.key !== key);
-      await this.area.set(STORAGE_KEYS.history, this.cache);
-      return entries.length - this.cache.length;
+      const saved = entries.filter((entry) => entry.key !== key);
+      await this.area.set(STORAGE_KEYS.history, saved);
+      this.cache = saved;
+      return entries.length - saved.length;
     });
   }
 
@@ -97,8 +114,8 @@ export class DownloadHistoryStore {
   async clear(): Promise<number> {
     return this.serialize(async () => {
       const entries = await this.list();
+      await this.area.set(STORAGE_KEYS.history, []);
       this.cache = [];
-      await this.area.set(STORAGE_KEYS.history, this.cache);
       return entries.length;
     });
   }
@@ -112,8 +129,15 @@ export class DownloadHistoryStore {
 /** Newest-first recent-search list, deduplicated per server. */
 export class SearchHistoryStore {
   private cache: SearchHistoryEntry[] | null = null;
+  private chain: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly area: StorageArea) {}
+
+  private serialize<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.chain.then(task, task);
+    this.chain = next.then(() => undefined, () => undefined);
+    return next;
+  }
 
   async list(serverId?: string | null): Promise<SearchHistoryEntry[]> {
     if (!this.cache) {
@@ -127,39 +151,45 @@ export class SearchHistoryStore {
   }
 
   async add(serverId: string, query: string, perServerLimit: number): Promise<SearchHistoryEntry[]> {
-    const trimmed = (query ?? '').trim();
-    const limit = Math.max(0, Math.floor(perServerLimit));
-    let entries = await this.list();
-    if (trimmed) {
-      // The query moves to the front when it is used again.
-      entries = entries.filter((entry) => !(entry.serverId === serverId && entry.query.toLowerCase() === trimmed.toLowerCase()));
-      entries.unshift({ serverId, query: trimmed, at: new Date().toISOString() });
-    }
-    // Trim each server's own list to `perServerLimit` entries.
-    const counts = new Map<string, number>();
-    entries = entries.filter((entry) => {
-      const used = counts.get(entry.serverId) ?? 0;
-      if (used >= limit && limit > 0) return false;
-      counts.set(entry.serverId, used + 1);
-      return true;
+    return this.serialize(async () => {
+      const trimmed = (query ?? '').trim();
+      const limit = Math.max(0, Math.floor(perServerLimit));
+      if (limit === 0) return this.list(serverId);
+      let entries = await this.list();
+      if (trimmed) {
+        // The query moves to the front when it is used again.
+        entries = entries.filter((entry) => !(entry.serverId === serverId && entry.query.toLowerCase() === trimmed.toLowerCase()));
+        entries.unshift({ serverId, query: trimmed, at: new Date().toISOString() });
+      }
+      const counts = new Map<string, number>();
+      entries = entries.filter((entry) => {
+        const used = counts.get(entry.serverId) ?? 0;
+        if (used >= limit && limit > 0) return false;
+        counts.set(entry.serverId, used + 1);
+        return true;
+      });
+      this.cache = entries.slice(0, MAX_SEARCH_ENTRIES);
+      await this.area.set(STORAGE_KEYS.searches, this.cache);
+      return this.list(serverId);
     });
-    this.cache = entries.slice(0, MAX_SEARCH_ENTRIES);
-    await this.area.set(STORAGE_KEYS.searches, this.cache);
-    return this.list(serverId);
   }
 
   async remove(serverId: string, query: string): Promise<SearchHistoryEntry[]> {
-    const entries = await this.list();
-    this.cache = entries.filter((entry) => !(entry.serverId === serverId && entry.query === query));
-    await this.area.set(STORAGE_KEYS.searches, this.cache);
-    return this.list(serverId);
+    return this.serialize(async () => {
+      const entries = await this.list();
+      this.cache = entries.filter((entry) => !(entry.serverId === serverId && entry.query === query));
+      await this.area.set(STORAGE_KEYS.searches, this.cache);
+      return this.list(serverId);
+    });
   }
 
   async clear(serverId?: string | null): Promise<number> {
-    const entries = await this.list();
-    this.cache = serverId ? entries.filter((entry) => entry.serverId !== serverId) : [];
-    await this.area.set(STORAGE_KEYS.searches, this.cache);
-    return entries.length - this.cache.length;
+    return this.serialize(async () => {
+      const entries = await this.list();
+      this.cache = serverId ? entries.filter((entry) => entry.serverId !== serverId) : [];
+      await this.area.set(STORAGE_KEYS.searches, this.cache);
+      return entries.length - this.cache.length;
+    });
   }
 
   invalidate(): void {

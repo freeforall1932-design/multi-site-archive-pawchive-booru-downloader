@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServerConfig } from '../../src/core/servers.js';
-import { PreviewDownloader, previewMediaUrl } from '../../src/platform/preview.js';
+import { PreviewDownloader, PreviewPlatform, previewMediaUrl } from '../../src/platform/preview.js';
+import { MemoryStorageArea } from '../../src/core/storage.js';
 import { withPreviewMedia } from '../../src/preview/preview.js';
 import type { SearchResult } from '../../src/shared/types.js';
 import { createHarness } from '../helpers.js';
@@ -20,6 +21,17 @@ describe('offline preview media', () => {
     const preview = withPreviewMedia(request, raw);
     expect(preview.ok).toBe(true);
     if (preview.ok) expect((preview.data as SearchResult).posts[1]?.previewUrl).toMatch(/^\/mock\/media\/\d+\.jpg$/);
+  });
+
+  it('opens the preview options and panel at their built routes', async () => {
+    const open = vi.fn();
+    vi.stubGlobal('open', open);
+    vi.stubGlobal('location', { search: '?tab=https%3A%2F%2Fe621.net%2Fposts%2F1' });
+    const platform = new PreviewPlatform({ handler: async () => ({ ok: true, data: null }), storage: new MemoryStorageArea() });
+    platform.openOptions('queue');
+    await platform.openPanel();
+    expect(open).toHaveBeenCalledWith('/dist/options/options.html#queue', '_blank', 'noopener');
+    expect(open).toHaveBeenCalledWith('/dist/panel/panel.html?tab=https%3A%2F%2Fe621.net%2Fposts%2F1', '_blank', 'noopener');
   });
 
   it('never starts a live download from the preview, including off-site links', async () => {

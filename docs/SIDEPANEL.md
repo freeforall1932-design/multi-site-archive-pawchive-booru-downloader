@@ -58,11 +58,14 @@ one dock, one list, one settings screen — while staying a *booru* tool:
 |  | Rows carry the media badge (`pic`/`video`), the canonical **rating chip**, the profile's site type and a `saved` badge | `queue/list` (rating is stored on the row at enqueue time) |
 | **Links** | Download **tasks** (one per creator) plus the raw link list: collect a creator's off-site links, download what is missing, rescan for new uploads, pause, export/import a package | `tasks/*`, `links/list`, `links/posts`, `links/scanPost`, `links/queue`, `links/remove`, `links/clear`, `links/export`, `links/import`, `queue/enqueueLinks` |
 | **Servers** | Full server manager (list, add/edit/validate, duplicate, delete, set default) plus diagnostics | `servers/*`, `diagnostics/info`, `userAgent/sync` |
-| **Settings** | The sectioned settings screen (identical to the options page's) | `settings/get`, `settings/save`, `servers/export|import`, `history/*`, `searches/*` |
+| **Settings** | The shared sectioned settings screen; panel edits autosave, while the options page uses a draft and Save | `settings/get`, `settings/save`, `servers/export|import`, `history/*`, `searches/*` |
 
-Everything the panel shows is fetched through the background worker. The panel
-never holds a credential, never issues a network request and never writes a file
-itself — the same rule the options page and popup follow.
+The panel sends API actions to the worker; non-Hydrus images can request remote
+thumbnails directly. Hydrus thumbnails use a bounded authenticated worker request,
+and its new URLs omit the key. Chrome Downloads' handling of authenticated download
+headers remains unverified. Collected links can contain share keys, so masked
+profile views are not a guarantee that all displayed content is secret-free. See
+[SECURITY.md](SECURITY.md).
 
 ## The list is the queue
 
@@ -134,7 +137,7 @@ options page and the popup. Defaults in brackets.
 | --- | --- |
 | **Queue start workers** [2] | Parallel workers preparing download starts, not a limit on active Chrome transfers. The dock control writes the same value. |
 | **Wait between requests to one server** [1 s] | Per-server spacing for API calls; adapters raise it when the site documents a hard limit (e621: 2 req/s), and the stricter value wins. |
-| **Retries per download** [3] | Retries for transient failures (network, 5xx, "slow down"). Auth and configuration errors are never retried. |
+| **API request attempts** [3] | Maximum attempts, including the first, for transient API/validation failures (network, 5xx, rate limits). Auth errors are not retried. Chrome file transfers are not automatically restarted. |
 | **If the file already exists** [`uniquify`] | Keep both (add a number) or overwrite. Passed straight to `chrome.downloads`. |
 
 ### 3. Multiple download → file rendition
@@ -237,8 +240,8 @@ flight and keeps everything found so far.
 The run **belongs to a task** (`tasks/begin` opens it before the first request),
 which is what makes the rest work:
 
-- every URL found in a post body is stored in `bsm.links` with its post, provider
-  and creator, and joined to the task;
+- each URL matching the configured filter is stored in `bsm.links` with its
+  post, provider and creator, and joined to the task;
 - posts already scanned are remembered, so a *Rescan* only visits new ones;
 - each run is appended to the task's history, so "what did the last pass do?" has
   an answer even after the panel was closed.
@@ -336,8 +339,10 @@ Two small stores (`src/core/history.ts`), both in `chrome.storage.local`:
   are checked. Capped at 5000 entries.
 - `bsm.searches` — recent queries per server (capped by the setting, 500 overall).
 
-Neither contains credentials. The only thing "Reset download history" changes is
-what the *listing* shows; nothing is deleted from disk.
+History contains post URLs and search queries can be sensitive. Legacy Hydrus
+key parameters in post-history URLs are removed on read; browser download/history
+records and old exports require manual cleanup. "Reset download history" clears
+the notebook and affects what the listing shows; it does not delete files.
 
 ## Using the panel
 

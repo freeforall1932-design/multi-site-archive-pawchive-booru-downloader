@@ -10,13 +10,15 @@ export interface HttpRequestSpec {
   headers?: Record<string, string>;
   body?: string;
   timeoutMs?: number;
+  /** Reject redirects for requests whose custom headers carry credentials. */
+  redirect?: RequestRedirect;
   /** Adapter/site tag used in diagnostics. */
   tag?: string;
   /** Human label for the validation trace. */
   label?: string;
 }
 
-/** Sanitized snapshot of a response - safe to persist/render. */
+/** Internal response data: url, headers and body may contain secrets. Persist/render only explicitly redacted fields. */
 export interface HttpResponseSnapshot {
   url: string;
   /** Credential-free URL for display. */
@@ -126,7 +128,7 @@ function headersToRecord(headers: Headers): Record<string, string> {
  * - timeouts via AbortController
  * - retry with exponential backoff for transient/ratelimited responses
  * - per-key rate limiting
- * - redacted diagnostics events (credentials never leave this module)
+ * - redacted diagnostics events (internal requests/responses may contain secrets)
  */
 export class HttpClient {
   private readonly fetchImpl: FetchLike;
@@ -153,10 +155,10 @@ export class HttpClient {
     this.onEvent?.({ ...event, url: redactUrl(event.url) });
   }
 
-  async request(spec: HttpRequestSpec, options: { signal?: AbortSignal; rateKey?: string; minIntervalMs?: number } = {}): Promise<HttpResponseSnapshot> {
+  async request(spec: HttpRequestSpec, options: { signal?: AbortSignal; rateKey?: string; minIntervalMs?: number; maxAttempts?: number } = {}): Promise<HttpResponseSnapshot> {
     const method: HttpMethod = spec.method ?? 'GET';
     const rateKey = options.rateKey ?? spec.url;
-    const maxAttempts = Math.max(1, this.maxRetries);
+    const maxAttempts = Math.max(1, options.maxAttempts ?? this.maxRetries);
     let attempt = 0;
     let lastError: BooruError | null = null;
 
@@ -205,9 +207,14 @@ export class HttpClient {
           throw new BooruError('Request aborted', { kind: 'network-failure', cause: error });
         }
         const isTimeout = error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError');
+        let detail = redactUrlsInText(error instanceof Error ? error.message : String(error));
+        const masked = redactHeaders(spec.headers ?? {});
+        for (const [name, value] of Object.entries(spec.headers ?? {})) {
+          if (masked[name] === '***' && value) detail = detail.split(value).join('***');
+        }
         lastError = new BooruError(
-          isTimeout ? `Request timed out after ${spec.timeoutMs ?? this.defaultTimeoutMs}ms` : `Network request failed: ${redactUrlsInText(error instanceof Error ? error.message : String(error))}`,
-          { kind: 'network-failure', cause: error },
+          isTimeout ? `Request timed out after ${spec.timeoutMs ?? this.defaultTimeoutMs}ms` : `Network request failed: ${detail}`,
+          { kind: 'network-failure', cause: Object.values(masked).includes('***') ? undefined : error },
         );
         this.emit({ type: 'error', url: spec.url, method, attempt, durationMs, message: lastError.message });
         if (attempt < maxAttempts) {
@@ -219,6 +226,69 @@ export class HttpClient {
       }
     }
     throw lastError ?? new BooruError('Request failed', { kind: 'unknown' });
+  }
+
+  /** Fetch a small raster thumbnail without redirects or unbounded buffering. */
+  async requestImage(
+    spec: HttpRequestSpec,
+    options: { rateKey: string; minIntervalMs?: number; maxBytes: number },
+  ): Promise<string> {
+    return this.rateLimiter.run(options.rateKey, async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), spec.timeoutMs ?? this.defaultTimeoutMs);
+      try {
+        const response = await this.fetchImpl(spec.url, {
+          method: 'GET', headers: spec.headers, signal: controller.signal,
+          redirect: 'error', credentials: 'omit', cache: 'no-store',
+        });
+        if (!response.ok) {
+          throw new BooruError(`Thumbnail request failed (HTTP ${response.status}).`, {
+            kind: [401, 403, 419].includes(response.status) ? 'auth-failure' : 'network-failure', status: response.status,
+          });
+        }
+        const mime = (response.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase();
+        if (!['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif'].includes(mime)) {
+          throw new BooruError('Thumbnail response is not a supported raster image.', { kind: 'parse-failure' });
+        }
+        const declaredSize = Number(response.headers.get('content-length'));
+        if (Number.isFinite(declaredSize) && declaredSize > options.maxBytes) {
+          throw new BooruError('Thumbnail is larger than the allowed size.', { kind: 'parse-failure' });
+        }
+        const reader = response.body?.getReader();
+        if (!reader) throw new BooruError('Thumbnail response has no body.', { kind: 'parse-failure' });
+        // A fixed buffer also bounds overhead if a hostile stream sends many
+        // tiny chunks. The caller sets a small limit (1 MiB for Hydrus).
+        const bytes = new Uint8Array(options.maxBytes);
+        let size = 0;
+        try {
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (size + value.byteLength > options.maxBytes) {
+              void reader.cancel().catch(() => undefined);
+              throw new BooruError('Thumbnail is larger than the allowed size.', { kind: 'parse-failure' });
+            }
+            bytes.set(value, size);
+            size += value.byteLength;
+          }
+        } finally {
+          reader.releaseLock();
+        }
+        if (!size) throw new BooruError('Thumbnail response is empty.', { kind: 'parse-failure' });
+        let binary = '';
+        for (let offset = 0; offset < size; offset += 0x8000) {
+          binary += String.fromCharCode(...bytes.subarray(offset, Math.min(size, offset + 0x8000)));
+        }
+        return `data:${mime};base64,${btoa(binary)}`;
+      } catch (error) {
+        if (error instanceof BooruError) throw error;
+        // Do not echo fetch exceptions, which may contain URLs or header values.
+        throw new BooruError('Could not fetch the authenticated thumbnail.', { kind: 'network-failure' });
+      } finally {
+        clearTimeout(timer);
+        controller.abort();
+      }
+    }, options.minIntervalMs);
   }
 
   private async perform(
@@ -238,7 +308,7 @@ export class HttpClient {
         headers: spec.headers,
         body: spec.body,
         signal: controller.signal,
-        redirect: 'follow',
+        redirect: spec.redirect ?? 'follow',
         credentials: 'omit',
         cache: 'no-store',
       });

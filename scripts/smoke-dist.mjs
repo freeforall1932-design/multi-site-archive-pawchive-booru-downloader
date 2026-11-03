@@ -212,6 +212,7 @@ function installBrowserStubs() {
     getElementById: (id) => byId(id),
     querySelector: () => null,
     querySelectorAll: () => [],
+    listeners: {},
     addEventListener(type, handler) {
       (this.listeners[type] ??= []).push(handler);
     },
@@ -494,8 +495,17 @@ async function walkTabs(registry) {
       check('settings pane shows a hint per option', (registry.get('settings-host')?.find((node) => node.tagName === 'SMALL') ?? null) !== null);
     }
     if (paneId === 'pane-servers') {
-      const servers = collectText(registry.get('servers-host') ?? createElement());
+      const serversHost = registry.get('servers-host') ?? createElement();
+      const servers = collectText(serversHost);
       check('servers pane lists the saved profiles', servers.includes('e621'), servers.slice(0, 160));
+      const filter = serversHost.find((node) => node.id === 'server-filter');
+      if (filter) {
+        filter.value = 'pawchive';
+        filter.fire('input', { type: 'input', target: filter });
+      }
+      const list = serversHost.find((node) => node.className === 'server-list');
+      const filtered = collectText(list ?? createElement());
+      check('panel server filter restricts visible profiles', !!filter && /pawchive/i.test(filtered) && !/e621/i.test(filtered), filtered.slice(0, 160));
     }
     if (paneId === 'pane-links') {
       const links = collectText(registry.get('links-host') ?? createElement());

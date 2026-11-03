@@ -29,8 +29,9 @@ Read as a specification, that is a **job manifest + job view + job-level
 controls**, with the concrete behaviours the user then named:
 
 - *traceable* — the task remembers **artist, service, site, post** for every file;
-- *re-runnable* — pressing Download again must fetch **new posts and failed files
-  only**, never re-download what is already on disk;
+- *re-runnable* — collect/rescan for new links, then download missing or failed
+  entries without re-queueing browser-confirmed completions. The extension cannot
+  verify what still exists on disk; unverified starts can duplicate a file;
 - *stateful per file* — `done` / `failed` / `queued` / `new`, with the saved
   filename and any error, so "complete", "partial success" and "failed" are
   distinguishable at the task level;
@@ -66,7 +67,7 @@ The manifest format is versioned (`format: "booru-server-manager.task"`,
 | Option | Behaviour | Verdict |
 | --- | --- | --- |
 | (a) Always idle | Task lands paused with a Start button. | **Chosen default.** Nobody's bandwidth or a volunteer site's rate limit should be spent because a file was opened. |
-| (b) Always auto-start | Like a torrent client with auto-start. | Rejected as a default; available as the existing **Start downloading immediately** setting. |
+| (b) Always auto-start | Like a torrent client with auto-start. | Rejected on import. The **Start downloading immediately** setting only controls whether the queue starts after an explicit Download missing action. |
 | (c) Ask every time | A prompt. | Parked: a prompt on import is noise once (a) and (b) are both reachable from settings. |
 | **(d) Idle + explicit Start/Pause (user's answer)** | Lands idle; one button starts everything missing; Pause returns it to idle and can be resumed later. | **Chosen.** Pause cancels the task's pending queue rows, so "paused" means paused — the files already saved stay saved, and Start later picks up exactly where it stopped. |
 
@@ -126,8 +127,8 @@ by extension, and accepts:
   filename, or unfiled links when there is no creator to name it after.
 
 **Pause = cancel pending rows of this task.** Running downloads are never killed
-mid-file; the task returns to `idle` and its `queued` members fall back to `new`,
-so Start later resumes exactly the remaining work.
+mid-file; waiting members fall back to `new`, while an active transfer remains
+tracked and may keep the task in progress. Start later queues the remaining work.
 
 ## 4. Parked ideas (kept deliberately)
 
@@ -155,5 +156,6 @@ TaskRun { id, startedAt, finishedAt, scannedPosts, added, queued, done, failed, 
 ```
 
 Storage: `bsm.tasks` (`src/core/task-store.ts`), next to `bsm.links`, `bsm.queue`,
-`bsm.history`. Nothing in a task or a manifest is secret: it is the same
-information the panel shows.
+`bsm.history`. Tasks and manifests can contain private share URLs, bearer tokens
+and Mega decryption fragments. Treat exports as sensitive even if the same URLs
+are visible in the panel.

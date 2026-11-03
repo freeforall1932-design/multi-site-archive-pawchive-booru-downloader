@@ -26,6 +26,8 @@ import { toast } from './toast.js';
 export interface SettingsSectionsState {
   settings: ExtensionSettings;
   saving: boolean;
+  /** The options page uses an explicit draft; the side panel saves edits. */
+  autoSave?: boolean;
   servers: ServerConfigView[];
   adapters: AdapterCatalogEntry[];
   historyCount: number;
@@ -145,7 +147,9 @@ export function renderSettingsSections(
   container.appendChild(
     section(
       'Global behaviour',
-      'Applies to every server unless an adapter requires stricter limits. Changes are stored as you make them; the Save button is a shortcut, not a requirement.',
+      state.autoSave === false
+        ? 'Applies to every server unless an adapter requires stricter limits. Changes here are a draft until you press Save settings.'
+        : 'Applies to every server unless an adapter requires stricter limits. Changes are stored as you make them; Save settings re-applies them.',
     ),
   );
   container.appendChild(
@@ -242,7 +246,7 @@ export function renderSettingsSections(
   );
   container.appendChild(
     row(
-      'Retries per download',
+      'API request attempts',
       select(
         String(settings.maxRetries) as never,
         [
@@ -254,7 +258,7 @@ export function renderSettingsSections(
         (value) => callbacks.onChange({ maxRetries: Number(value) }),
         { id: 'psRetries' },
       ),
-      'Transient failures (network glitches, 5xx, "slow down" answers) are retried with backoff. Authentication and missing-configuration errors are never retried - they would fail again.',
+      'Maximum attempts for transient API and validation failures (including the first request). Network errors, 5xx and rate limits use backoff; authentication errors are not retried. Chrome file transfers are not automatically restarted.',
     ),
   );
   container.appendChild(
@@ -676,7 +680,9 @@ export function renderSettingsSections(
       'div',
       { class: 'psFooter' },
       button(state.saving ? 'Saving…' : 'Save settings', { variant: 'primary', disabled: state.saving, onClick: () => callbacks.onSave() }),
-      h('small', { class: 'psHint', text: 'Settings are stored as you change them; use this button to re-apply and sync the User-Agent rules in one go.' }),
+      h('small', { class: 'psHint', text: state.autoSave === false
+        ? 'Save this draft and sync the User-Agent rules. Changes made while saving remain in the draft.'
+        : 'Settings are stored as you change them; use this button to re-apply and sync the User-Agent rules in one go.' }),
     ),
   );
 }

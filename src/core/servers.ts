@@ -1,7 +1,7 @@
 import { BooruError } from '../shared/errors.js';
 import type { Rating, ServerConfig, ServerConfigView, ValidationResult } from '../shared/types.js';
 import { ALL_RATINGS } from '../shared/types.js';
-import { createId, deepClone, isValidHttpUrl, maskSecret, normalizeBaseUrl, unique } from '../shared/util.js';
+import { createId, deepClone, isValidHttpUrl, maskSecret, normalizeBaseUrl, redactUrl, safeUrl, unique } from '../shared/util.js';
 import { getAdapter, requireAdapter } from './registry.js';
 import { STORAGE_KEYS, type StorageArea } from './storage.js';
 
@@ -12,8 +12,27 @@ export function isUsableServer(server: Pick<ServerConfig, 'siteType' | 'baseUrl'
   const adapter = getAdapter(server.siteType);
   if (!adapter) return false;
   try {
-    const url = adapter.normalizeBaseUrl ? adapter.normalizeBaseUrl(server.baseUrl) : server.baseUrl;
-    return isValidHttpUrl(normalizeBaseUrl(url));
+    const url = normalizeBaseUrl(adapter.normalizeBaseUrl ? adapter.normalizeBaseUrl(server.baseUrl) : server.baseUrl);
+    const parsed = safeUrl(url);
+    return isValidHttpUrl(url) && !parsed?.username && !parsed?.password;
+  } catch {
+    return false;
+  }
+}
+
+/** Compare normalized connection targets before reusing an existing secret. */
+export function sameServerConnection(
+  left: Pick<ServerConfig, 'siteType' | 'baseUrl'>,
+  right: Pick<ServerConfig, 'siteType' | 'baseUrl'>,
+): boolean {
+  if (left.siteType !== right.siteType) return false;
+  const adapter = getAdapter(left.siteType);
+  if (!adapter) return false;
+  try {
+    const normalize = (baseUrl: string) => normalizeBaseUrl(adapter.normalizeBaseUrl ? adapter.normalizeBaseUrl(baseUrl) : baseUrl);
+    const first = normalize(left.baseUrl);
+    const second = normalize(right.baseUrl);
+    return !!first && first === second;
   } catch {
     return false;
   }
@@ -57,9 +76,16 @@ export interface ImportResult {
  */
 export class ServerStore {
   private cache: ServerConfig[] | null = null;
+  private chain: Promise<unknown> = Promise.resolve();
   private readonly listeners = new Set<ServerListener>();
 
   constructor(private readonly area: StorageArea) {}
+
+  private serialize<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.chain.then(task, task);
+    this.chain = next.then(() => undefined, () => undefined);
+    return next;
+  }
 
   // ---------------------------------------------------------------- reads
 
@@ -100,74 +126,89 @@ export class ServerStore {
    * adapter, so custom ports, trailing slashes and pasted API URLs behave.
    */
   async save(input: SaveServerInput, options: SaveServerOptions = {}): Promise<ServerConfig> {
-    const keepSecrets = options.keepSecretsWhenBlank !== false;
-    const servers = await this.list();
+    return this.serialize(async () => {
+      const keepSecrets = options.keepSecretsWhenBlank !== false;
+      const servers = await this.list();
 
-    const existingIndex = input.id ? servers.findIndex((server) => server.id === input.id) : -1;
-    const existing = existingIndex >= 0 ? servers[existingIndex]! : null;
+      const existingIndex = input.id ? servers.findIndex((server) => server.id === input.id) : -1;
+      const existing = existingIndex >= 0 ? servers[existingIndex]! : null;
 
-    const siteType = (input.siteType ?? existing?.siteType ?? '').trim();
-    if (!siteType) {
-      throw new BooruError('A site type is required to save a server', { kind: 'incomplete-config' });
-    }
-    const adapter = requireAdapter(siteType);
+      const siteType = (input.siteType ?? existing?.siteType ?? '').trim();
+      if (!siteType) {
+        throw new BooruError('A site type is required to save a server', { kind: 'incomplete-config' });
+      }
+      const adapter = requireAdapter(siteType);
 
-    // An intentionally blank field falls back to the adapter's documented root.
-    const rawBaseUrl = firstNonEmpty(input.baseUrl, existing?.baseUrl, adapter.defaults.baseUrl).trim();
-    if (!rawBaseUrl) {
-      throw new BooruError('A base URL is required to save a server', { kind: 'incomplete-config' });
-    }
-    const baseUrl = normalizeBaseUrl(adapter.normalizeBaseUrl ? adapter.normalizeBaseUrl(rawBaseUrl) : rawBaseUrl) || rawBaseUrl;
+      // An intentionally blank field falls back to the adapter's documented root.
+      const rawBaseUrl = firstNonEmpty(input.baseUrl, existing?.baseUrl, adapter.defaults.baseUrl).trim();
+      if (!rawBaseUrl) {
+        throw new BooruError('A base URL is required to save a server', { kind: 'incomplete-config' });
+      }
+      const baseUrl = normalizeBaseUrl(adapter.normalizeBaseUrl ? adapter.normalizeBaseUrl(rawBaseUrl) : rawBaseUrl) || rawBaseUrl;
+      const parsedBase = safeUrl(baseUrl);
+      if (parsedBase?.username || parsedBase?.password) {
+        throw new BooruError('Server URLs cannot contain embedded credentials.', {
+          kind: 'incomplete-config', hint: 'Remove user information from the URL and use the profile credential fields instead.',
+        });
+      }
 
-    const incomingApiKey = typeof input.apiKey === 'string' ? input.apiKey.trim() : undefined;
-    const apiKey = incomingApiKey === undefined || (keepSecrets && incomingApiKey === '')
-      ? existing?.apiKey ?? ''
-      : incomingApiKey;
+      const incomingApiKey = typeof input.apiKey === 'string' ? input.apiKey.trim() : undefined;
+      const preserveKey = incomingApiKey === undefined || (keepSecrets && incomingApiKey === '');
+      if (existing?.apiKey && preserveKey && !sameServerConnection(existing, { siteType, baseUrl })) {
+        throw new BooruError('Changing the server URL or site type requires an explicit credential choice.', {
+          kind: 'incomplete-config',
+          hint: 'Re-enter the key for the new server, or clear the old profile credentials before changing it.',
+        });
+      }
+      const apiKey = preserveKey ? existing?.apiKey ?? '' : incomingApiKey ?? '';
 
-    const allowedRatings = this.normalizeRatings(input.allowedRatings ?? existing?.allowedRatings, adapter.defaults.ratings);
+      const allowedRatings = this.normalizeRatings(input.allowedRatings ?? existing?.allowedRatings, adapter.defaults.ratings);
 
-    const next: ServerConfig = {
-      id: existing?.id ?? input.id ?? createId('srv'),
-      label: firstNonEmpty(input.label, existing?.label, adapter.defaults.label).trim() || adapter.defaults.label,
-      siteType,
-      baseUrl,
-      ratingFilterEnabled: input.ratingFilterEnabled ?? existing?.ratingFilterEnabled ?? true,
-      username: (input.username ?? existing?.username ?? '').trim(),
-      apiKey,
-      userId: (input.userId ?? existing?.userId ?? '').trim(),
-      customUserAgent: (input.customUserAgent ?? existing?.customUserAgent ?? '').trim(),
-      // `true` promotes this profile; `false` never demotes an existing default,
-      // and the very first saved profile becomes the default automatically.
-      isDefault: input.isDefault === true ? true : existing?.isDefault ?? !servers.some((server) => server.isDefault),
-      validationStatus: existing?.validationStatus ?? 'unknown',
-      validationMessage: existing?.validationMessage ?? '',
-      lastValidatedAt: existing?.lastValidatedAt ?? null,
-      allowedRatings,
-      lastValidationTrace: existing?.lastValidationTrace,
-      createdAt: existing?.createdAt ?? new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      notes: input.notes ?? existing?.notes,
-    };
+      const next: ServerConfig = {
+        id: existing?.id ?? input.id ?? createId('srv'),
+        label: firstNonEmpty(input.label, existing?.label, adapter.defaults.label).trim() || adapter.defaults.label,
+        siteType,
+        baseUrl,
+        ratingFilterEnabled: input.ratingFilterEnabled ?? existing?.ratingFilterEnabled ?? true,
+        username: (input.username ?? existing?.username ?? '').trim(),
+        apiKey,
+        userId: (input.userId ?? existing?.userId ?? '').trim(),
+        customUserAgent: (input.customUserAgent ?? existing?.customUserAgent ?? '').trim(),
+        // `true` promotes this profile; `false` never demotes an existing default,
+        // and the very first saved profile becomes the default automatically.
+        isDefault: input.isDefault === true ? true : existing?.isDefault ?? !servers.some((server) => server.isDefault),
+        validationStatus: existing?.validationStatus ?? 'unknown',
+        validationMessage: existing?.validationMessage ?? '',
+        lastValidatedAt: existing?.lastValidatedAt ?? null,
+        allowedRatings,
+        lastValidationTrace: existing?.lastValidationTrace,
+        createdAt: existing?.createdAt ?? new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        notes: input.notes ?? existing?.notes,
+      };
 
-    if (this.validationInvalidated(existing, next)) {
-      next.validationStatus = 'unknown';
-      next.validationMessage = '';
-      next.lastValidatedAt = null;
-      next.lastValidationTrace = [];
-    }
+      if (this.validationInvalidated(existing, next)) {
+        next.validationStatus = 'unknown';
+        next.validationMessage = '';
+        next.lastValidatedAt = null;
+        next.lastValidationTrace = [];
+      }
 
-    if (existingIndex >= 0) servers[existingIndex] = next;
-    else servers.push(next);
+      if (existingIndex >= 0) servers[existingIndex] = next;
+      else servers.push(next);
 
-    const normalized = next.isDefault ? this.promoteDefault(servers, next.id) : servers;
-    const saved = await this.persist(normalized);
-    return saved.find((server) => server.id === next.id) ?? next;
+      const normalized = next.isDefault ? this.promoteDefault(servers, next.id) : servers;
+      const saved = await this.persist(normalized);
+      return saved.find((server) => server.id === next.id) ?? next;
+    });
   }
 
   async remove(id: string): Promise<ServerConfig[]> {
-    const servers = await this.list();
-    const remaining = servers.filter((server) => server.id !== id);
-    return this.persist(remaining);
+    return this.serialize(async () => {
+      const servers = await this.list();
+      const remaining = servers.filter((server) => server.id !== id);
+      return this.persist(remaining);
+    });
   }
 
   /** Duplicate a profile (same connection + credentials, fresh id, not default). */
@@ -175,6 +216,12 @@ export class ServerStore {
     const source = await this.get(id);
     if (!source) {
       throw new BooruError(`Cannot duplicate unknown server ${id}`, { kind: 'unknown' });
+    }
+    const target = { siteType: overrides.siteType ?? source.siteType, baseUrl: overrides.baseUrl ?? source.baseUrl };
+    if (source.apiKey && !sameServerConnection(source, target) && typeof overrides.apiKey !== 'string') {
+      throw new BooruError('Changing the duplicate server target requires an explicit credential choice.', {
+        kind: 'incomplete-config', hint: 'Provide a key for the new server or explicitly clear it.',
+      });
     }
     const copy: SaveServerInput = {
       ...deepClone(source),
@@ -192,45 +239,51 @@ export class ServerStore {
   }
 
   async setDefault(id: string): Promise<ServerConfig[]> {
-    const servers = await this.list();
-    const target = servers.find((server) => server.id === id);
-    if (!target) {
-      throw new BooruError(`Cannot set unknown server ${id} as default`, { kind: 'unknown' });
-    }
-    const adapter = requireAdapter(target.siteType);
-    if (!isUsableServer(target)) {
-      // Preserve the adapter's more specific error, if it supplies one.
-      adapter.normalizeBaseUrl?.(target.baseUrl);
-      throw new BooruError('This server has an invalid base URL', { kind: 'incomplete-config' });
-    }
-    return this.persist(this.promoteDefault(servers, id));
+    return this.serialize(async () => {
+      const servers = await this.list();
+      const target = servers.find((server) => server.id === id);
+      if (!target) {
+        throw new BooruError(`Cannot set unknown server ${id} as default`, { kind: 'unknown' });
+      }
+      const adapter = requireAdapter(target.siteType);
+      if (!isUsableServer(target)) {
+        // Preserve the adapter's more specific error, if it supplies one.
+        adapter.normalizeBaseUrl?.(target.baseUrl);
+        throw new BooruError('This server has an invalid base URL', { kind: 'incomplete-config' });
+      }
+      return this.persist(this.promoteDefault(servers, id));
+    });
   }
 
   /** Store the outcome of a validation run carried out by the validation service. */
-  async updateValidation(id: string, result: ValidationResult): Promise<ServerConfig | null> {
-    const servers = await this.list();
-    const index = servers.findIndex((server) => server.id === id);
-    if (index < 0) return null;
-    const status: ServerConfig['validationStatus'] = result.ok
-      ? 'valid'
-      : result.kind === 'network-failure' || result.kind === 'rate-limited' || result.kind === 'server-error'
-        ? 'unreachable'
-        : result.endpointOk === false
-          ? 'invalid'
-          : result.authOk === false
+  async updateValidation(id: string, result: ValidationResult, expected?: ServerConfig): Promise<ServerConfig | null> {
+    return this.serialize(async () => {
+      const servers = await this.list();
+      const index = servers.findIndex((server) => server.id === id);
+      // A probe may finish after the user edits or removes the connection. Never
+      // attach the old result to new credentials or a different endpoint.
+      if (index < 0 || (expected && this.validationInvalidated(expected, servers[index]!))) return null;
+      const status: ServerConfig['validationStatus'] = result.ok
+        ? 'valid'
+        : result.kind === 'network-failure' || result.kind === 'rate-limited' || result.kind === 'server-error'
+          ? 'unreachable'
+          : result.endpointOk === false
             ? 'invalid'
-            : 'partial';
-    const target = servers[index]!;
-    servers[index] = {
-      ...target,
-      validationStatus: status,
-      validationMessage: result.message.slice(0, 500),
-      lastValidatedAt: result.checkedAt,
-      lastValidationTrace: result.trace.slice(-8),
-      updatedAt: new Date().toISOString(),
-    };
-    const saved = await this.persist(servers);
-    return saved.find((server) => server.id === id) ?? null;
+            : result.authOk === false
+              ? 'invalid'
+              : 'partial';
+      const target = servers[index]!;
+      servers[index] = {
+        ...target,
+        validationStatus: status,
+        validationMessage: result.message.slice(0, 500),
+        lastValidatedAt: result.checkedAt,
+        lastValidationTrace: result.trace.slice(-8),
+        updatedAt: new Date().toISOString(),
+      };
+      const saved = await this.persist(servers);
+      return saved.find((server) => server.id === id) ?? null;
+    });
   }
 
   /** Wipe stored credentials for one profile, keeping the rest of the config. */
@@ -239,19 +292,31 @@ export class ServerStore {
   }
 
   async update(id: string, patch: Partial<ServerConfig>): Promise<ServerConfig | null> {
-    const servers = await this.list();
-    const index = servers.findIndex((server) => server.id === id);
-    if (index < 0) return null;
-    servers[index] = { ...servers[index]!, ...patch, id, updatedAt: new Date().toISOString() };
-    const saved = await this.persist(servers);
-    return saved.find((server) => server.id === id) ?? null;
+    return this.serialize(async () => {
+      const servers = await this.list();
+      const index = servers.findIndex((server) => server.id === id);
+      if (index < 0) return null;
+      const previous = servers[index]!;
+      const next = { ...previous, ...patch, id, updatedAt: new Date().toISOString() };
+      if (this.validationInvalidated(previous, next)) {
+        next.validationStatus = 'unknown';
+        next.validationMessage = '';
+        next.lastValidatedAt = null;
+        next.lastValidationTrace = [];
+      }
+      servers[index] = next;
+      const saved = await this.persist(servers);
+      return saved.find((server) => server.id === id) ?? null;
+    });
   }
 
   /** Remove every stored profile (and therefore every stored credential). */
   async removeAll(): Promise<void> {
-    this.cache = [];
-    await this.area.set(STORAGE_KEYS.servers, []);
-    this.listeners.forEach((listener) => listener([]));
+    return this.serialize(async () => {
+      await this.area.set(STORAGE_KEYS.servers, []);
+      this.cache = [];
+      this.listeners.forEach((listener) => listener([]));
+    });
   }
 
   // ------------------------------------------------------- import / export
@@ -265,7 +330,7 @@ export class ServerStore {
       version: 1,
       exportedAt: new Date().toISOString(),
       includesSecrets: includeSecrets,
-      servers: servers.map((server) => (includeSecrets ? deepClone(server) : { ...deepClone(server), apiKey: '' })),
+      servers: servers.map((server) => (includeSecrets ? deepClone(server) : { ...deepClone(server), apiKey: '', baseUrl: redactUrl(server.baseUrl) })),
     };
     return JSON.stringify(payload, null, 2);
   }
@@ -384,8 +449,8 @@ export class ServerStore {
 
   private async persist(servers: ServerConfig[]): Promise<ServerConfig[]> {
     const sorted = sortServers(this.withSupportedDefault(servers));
-    this.cache = sorted;
     await this.area.set(STORAGE_KEYS.servers, sorted);
+    this.cache = sorted;
     this.listeners.forEach((listener) => listener(sorted.map((server) => deepClone(server))));
     return sorted.map((server) => deepClone(server));
   }
@@ -406,11 +471,15 @@ export function sortServers(servers: ServerConfig[]): ServerConfig[] {
   });
 }
 
-/** Strip secrets before anything crosses into the rendered UI. */
+/** Shape a profile view: mask its API key and redact known URL credentials. */
 export function toServerView(server: ServerConfig): ServerConfigView {
   const { apiKey, ...rest } = server;
+  const parsedBase = safeUrl(server.baseUrl);
+  const embeddedCredentials = !!(parsedBase?.username || parsedBase?.password);
   return {
     ...rest,
+    baseUrl: redactUrl(rest.baseUrl),
+    ...(embeddedCredentials ? { validationStatus: 'invalid' as const, validationMessage: 'Remove embedded credentials from the server URL.' } : {}),
     apiKeyMask: maskSecret(apiKey),
     hasApiKey: !!apiKey,
   };

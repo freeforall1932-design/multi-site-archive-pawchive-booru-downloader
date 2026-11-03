@@ -103,7 +103,7 @@ export function renderQueue(container: HTMLElement, state: QueueState, callbacks
           'td',
           {},
           h('strong', { text: `#${item.postId}` }),
-          item.postUrl ? h('a', { class: 'link small', href: item.postUrl, target: '_blank', rel: 'noreferrer', text: 'open' }) : null,
+          item.postUrl && (item.kind === 'link' || (server && server.siteType !== 'hydrus')) ? h('a', { class: 'link small', href: item.postUrl, target: '_blank', rel: 'noreferrer', text: 'open' }) : null,
         ),
         h('td', { text: server?.label ?? item.serverId }),
         h('td', {}, h('span', { class: `chip chip-status chip-${item.status}`, text: item.cancelRequested && item.status === 'running' ? 'canceling' : item.status === 'done' ? 'completed' : item.status }), item.attempts > 1 ? h('span', { class: 'muted small', text: ` try ${item.attempts}` }) : null),

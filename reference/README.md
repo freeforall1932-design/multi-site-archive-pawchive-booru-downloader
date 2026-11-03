@@ -49,8 +49,8 @@ Droidbooru_2_0_9_apk/
 |---|---|---|
 | `network/ParserE621JSON` | `src/adapters/e621.ts` | field mapping, `md5FromFile`, tag-category concatenation, fav-sync |
 | `network/ParserDanbooru2JSON`, `ParserDanbooru1JSON` | `src/adapters/danbooru.ts` | v1 vs v2 API differences, pool parsing (`ParserPoolDanbooru2JSON`) |
-| `network/ParserGelbooruJSON/XML/HTML` | `src/adapters/gelbooru.ts` | three transport fallbacks (JSON -> XML -> HTML scrape); `Gelbooru 0.1.11` vs 0.2 split |
-| `network/ParserTagAuto*JSON` | `src/core/search.ts` | per-site tag autocomplete endpoints and response shapes |
+| `network/ParserGelbooruJSON/XML/HTML` | `src/adapters/gelbooru.ts` | JSON support for Gelbooru 0.1.11 and 0.2 shapes; XML/HTML scraping fallbacks are not implemented here |
+| `network/ParserTagAuto*JSON` | (not implemented) | `src/core/search.ts` composes query filters; it does not call tag-autocomplete endpoints |
 | `network/ParserNote*` | (not implemented) | translation notes on posts |
 | `danbooru/ServerItemType`, `ServerItem` | `src/core/registry.ts`, `src/shared/types.ts` | their site-type enum and per-type defaults (auth fields, page-size caps, rating vocab) |
 | `danbooru/UserConfiguration` | `src/core/settings.ts` | full settings surface of a mature client - good checklist |
@@ -58,7 +58,7 @@ Droidbooru_2_0_9_apk/
 | `model/BlacklistRule`, `BannedTag` | settings tag blacklist | rule syntax |
 | `model/DownloadEntry`, `services/*` | `src/core/queue.ts`, `src/core/downloads.ts` | queue states, retry, resume, history |
 | `backup/*` | server export/import JSON | backup schema incl. what they exclude |
-| `network/HttpClient`, `CustomDNSSelector`, `model/ProxyConfiguration` | `src/shared/http.ts` | UA handling, retries, DNS-over-HTTPS option |
+| `network/HttpClient`, `CustomDNSSelector`, `model/ProxyConfiguration` | `src/shared/http.ts` + `src/core/userAgent.ts` | request retries and User-Agent handling; no custom DNS-over-HTTPS/proxy option |
 
 ## Families ported from this reference (2026-09-28)
 
@@ -80,5 +80,5 @@ Not ported, on purpose: `IBSearch` (site is gone), `Shimmie`, `ZeroChan`
   `v0_1`-style locals, `super.field` for `this.field`, and `return;` noise.
 - Anything platform-specific (Android `Context`, SQLite, ObjectBox, Glide, VLC)
   has no browser equivalent - port the *logic*, not the classes.
-- Everything here runs equally well in a browser extension, a Node/Deno CLI,
-  or a desktop wrapper (Tauri/Electron) - the booru APIs are plain HTTPS+JSON.
+- The HTTP/JSON concepts are portable, but the shipped extension also depends on
+  Chrome MV3 APIs; it is not a ready-made Node/Deno or desktop application.

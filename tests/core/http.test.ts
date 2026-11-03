@@ -8,6 +8,7 @@ import {
   type HttpClientOptions,
 } from '../../src/shared/http.js';
 import { BooruError, failureLabel, toBooruError } from '../../src/shared/errors.js';
+import { redactUrl } from '../../src/shared/util.js';
 import { classifyStatus, detectAuthWordsInBody } from '../../src/adapters/base.js';
 import { httpSnapshot, htmlSnapshot, jsonResponse } from '../helpers.js';
 
@@ -162,6 +163,14 @@ describe('HttpClient', () => {
     expect(snapshot.redactedUrl).toContain('user_id=***');
     expect(snapshot.redactedUrl).toContain('json=1');
     expect(events.join(' ')).not.toContain('super-secret');
+  });
+
+  it('redacts sensitive query names regardless of capitalization', () => {
+    const url = 'https://test.example/file?API_KEY=upper-secret&hydrus-client-api-access-key=hydrus-secret&other=visible';
+    const redacted = redactUrl(url);
+    expect(redacted).not.toContain('upper-secret');
+    expect(redacted).not.toContain('hydrus-secret');
+    expect(redacted).toContain('other=visible');
   });
 
   it('redacts keys when a network error embeds a complete sensitive URL', async () => {

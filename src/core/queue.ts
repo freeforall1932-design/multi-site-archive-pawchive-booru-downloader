@@ -13,12 +13,12 @@ import type {
   ServerConfig,
 } from '../shared/types.js';
 import { historyKey, type DownloadHistoryStore } from './history.js';
-import { createId, deepClone, isValidHttpUrl, redactUrlsInText } from '../shared/util.js';
+import { createId, deepClone, isValidHttpUrl, redactUrlsInText, stripHydrusCredentials } from '../shared/util.js';
 import { manualMirrorProvider, mirrorLinkId } from './links.js';
 import type { MirrorLinkStore } from './link-store.js';
 import type { TaskStore } from './task-store.js';
 import type { BooruClient } from './client.js';
-import { requireOriginalFile, type Downloader, type DownloadOutcome, type DownloadRequest } from './downloads.js';
+import { postDownloadAuth, requireOriginalFile, type Downloader, type DownloadOutcome, type DownloadRequest } from './downloads.js';
 import { buildDownloadPath, buildMirrorPath } from './naming.js';
 import { createAdapterContext, requireAdapter } from './registry.js';
 import type { ServerStore } from './servers.js';
@@ -138,6 +138,17 @@ export class DownloadQueue {
     const changed: QueueItem[] = [];
     this.items = items.map((previous) => {
       const item: QueueItem = { ...previous, kind: previous.kind ?? 'post', url: previous.url ?? null, rating: previous.rating ?? null };
+      // Older Hydrus versions persisted their access key in post URLs. Never
+      // alter mirror URLs (notably Mega fragment keys); only clean post rows.
+      if (item.kind !== 'link') {
+        const postUrl = stripHydrusCredentials(item.postUrl ?? '');
+        const historyUrl = item.historyEntry ? stripHydrusCredentials(item.historyEntry.postUrl ?? '') : null;
+        if (postUrl !== item.postUrl || (item.historyEntry && historyUrl !== item.historyEntry.postUrl)) {
+          item.postUrl = postUrl;
+          if (item.historyEntry && historyUrl !== null) item.historyEntry = { ...item.historyEntry, postUrl: historyUrl };
+          changed.push(item);
+        }
+      }
       // A start-only legacy success is not a completion. Also, a worker can die
       // between asking Chrome to start and persisting the returned ID; do not
       // silently re-start that ambiguous request and create a duplicate.
@@ -224,9 +235,10 @@ export class DownloadQueue {
 
   async enqueue(inputs: EnqueueInput[]): Promise<{ added: number; skipped: number }> {
     await this.ensureLoaded();
+    await this.repairBookkeeping();
     const existing = new Set(
       this.items
-        .filter((item) => item.status === 'pending' || item.status === 'running')
+        .filter((item) => item.status === 'pending' || item.status === 'running' || item.bookkeepingPending)
         .map((item) => queueItemKey(item)),
     );
     let added = 0;
@@ -244,7 +256,7 @@ export class DownloadQueue {
         serverId: input.serverId,
         postId: input.postId,
         label: input.label ?? `post ${input.postId}`,
-        postUrl: input.postUrl ?? '',
+        postUrl: input.kind === 'link' ? input.postUrl ?? '' : stripHydrusCredentials(input.postUrl ?? ''),
         kind: input.kind ?? 'post',
         url: input.url ?? null,
         rating: input.rating ?? null,
@@ -322,7 +334,7 @@ export class DownloadQueue {
       this.scheduledIds.delete(item.id);
       item.status = 'canceled';
       item.updatedAt = new Date(this.now()).toISOString();
-      await this.syncLinkRow(item, 'new', {});
+      item.bookkeepingPending = !(await this.syncLinkRow(item, 'new', {}));
       await this.persist();
       return;
     }
@@ -339,10 +351,13 @@ export class DownloadQueue {
   async retryFailed(): Promise<number> {
     await this.ensureLoaded();
     await Promise.all([...this.reconcileChains.values()].map((job) => job.catch(() => undefined)));
+    await this.repairBookkeeping();
     const active = new Set(this.items.filter((item) => item.status === 'pending' || item.status === 'running').map(queueItemKey));
     let requeued = 0;
     for (const item of this.items) {
       if (item.status !== 'failed' && item.status !== 'skipped' && item.status !== 'unverified') continue;
+      // Do not erase an unresolved outcome before link/task bookkeeping is durable.
+      if (item.bookkeepingPending) continue;
       const key = queueItemKey(item);
       if (active.has(key)) continue;
       active.add(key);
@@ -376,11 +391,13 @@ export class DownloadQueue {
     return this.remove(ids);
   }
 
-  /** Active rows cannot be removed: their browser outcomes would be lost. */
+  /** Active rows and unfinished bookkeeping stay until their outcomes are durable. */
   async remove(itemIds: readonly string[]): Promise<number> {
     await this.ensureLoaded();
+    await Promise.all([...this.reconcileChains.values()].map((job) => job.catch(() => undefined)));
+    await this.repairBookkeeping();
     const wanted = new Set(itemIds);
-    const removed = this.items.filter((item) => wanted.has(item.id) && item.status !== 'running');
+    const removed = this.items.filter((item) => wanted.has(item.id) && item.status !== 'running' && !item.bookkeepingPending);
     const removedIds = new Set(removed.map((item) => item.id));
     this.items = this.items.filter((item) => !removedIds.has(item.id));
     for (const id of removedIds) this.scheduledIds.delete(id);
@@ -476,10 +493,10 @@ export class DownloadQueue {
       next.cancelRequested = false;
       next.updatedAt = new Date(this.now()).toISOString();
       this.controllers.set(next.id, new AbortController());
-      // This must be durable BEFORE a Chrome start is attempted.
-      await this.persist();
-      await this.syncLinkRow(next, 'queued', { attempts: next.attempts });
       try {
+        // This must be durable BEFORE a Chrome start is attempted.
+        await this.persist();
+        await this.syncLinkRow(next, 'queued', { attempts: next.attempts });
         await this.processItem(next, settings);
       } catch (error) {
         await this.recordStartError(next, error);
@@ -497,8 +514,15 @@ export class DownloadQueue {
     conflictAction: DownloadRequest['conflictAction'];
   }): Promise<DownloadOutcome> {
     await this.ensureLoaded();
+    await this.repairBookkeeping();
     const target = requireOriginalFile(input.post);
+    const headers = postDownloadAuth(input.server, input.post, target);
     const key = `${input.server.id}:${input.post.id}`;
+    if (this.items.some((entry) => entry.kind !== 'link' && queueItemKey(entry) === key && entry.bookkeepingPending)) {
+      throw new BooruError('The previous download outcome could not be saved yet.', {
+        kind: 'unknown', hint: 'Refresh the queue and check Chrome Downloads before trying again.',
+      });
+    }
     let item = this.items.find((entry) => entry.kind !== 'link' && queueItemKey(entry) === key && entry.status === 'pending');
     if (input.server.siteType === 'pawchive' && item && item.attachmentIndexVersion !== 2) {
       throw new BooruError('This Pawchive queue row was created with older, ambiguous attachment numbering.', {
@@ -517,7 +541,7 @@ export class DownloadQueue {
     if (!item) {
       item = {
         id: createId('q'), serverId: input.server.id, postId: input.post.id,
-        label: `${input.server.siteType} #${input.post.id}`, postUrl: input.post.postUrl,
+        label: `${input.server.siteType} #${input.post.id}`, postUrl: stripHydrusCredentials(input.post.postUrl),
         kind: 'post', url: null, rating: input.post.rating, attachmentIndexVersion: 2,
         expectedFileHash: input.server.siteType === 'pawchive' ? input.post.md5 : null,
         status: 'pending', attempts: 0, error: null, errorKind: null,
@@ -533,9 +557,9 @@ export class DownloadQueue {
     item.updatedAt = timestamp;
     item.historyEntry = this.historyFor(item, input.server, input.post, input.filename);
     this.controllers.set(item.id, new AbortController());
-    await this.persist();
     try {
-      return await this.startBrowser(item, { url: target, filename: input.filename, conflictAction: input.conflictAction });
+      await this.persist();
+      return await this.startBrowser(item, { url: target, filename: input.filename, conflictAction: input.conflictAction, headers });
     } catch (error) {
       await this.recordStartError(item, error);
       throw error;
@@ -547,7 +571,7 @@ export class DownloadQueue {
   private historyFor(item: QueueItem, server: ServerConfig, post: BooruPost, filename: string): DownloadHistoryEntry {
     return {
       key: historyKey(server.id, post.id), serverId: server.id, siteType: server.siteType,
-      postId: post.id, label: item.label, filename, postUrl: post.postUrl,
+      postId: post.id, label: item.label, filename, postUrl: stripHydrusCredentials(post.postUrl),
       bytes: null, at: new Date(this.now()).toISOString(), quality: 'original',
     };
   }
@@ -563,13 +587,34 @@ export class DownloadQueue {
     item.downloadId = outcome.downloadId;
     item.bytes = outcome.bytes;
     item.updatedAt = new Date(this.now()).toISOString();
-    // The completion event can precede this write. Querying Chrome after it is
-    // durable catches that race, as well as a worker restart between the two.
-    await this.persist();
+    // Once Chrome accepts a start, a storage/reconciliation error must never be
+    // reported as a failed start: retrying it could duplicate a live transfer.
+    // Reconciliation retries the ID write; after a crash, a missing ID remains
+    // unverified instead of being started again.
     if (typeof outcome.downloadId !== 'number') {
-      await this.markUnverified(item, 'The browser did not return a download ID; check Chrome Downloads before retrying.');
-    } else {
+      try {
+        await this.markUnverified(item, 'The browser did not return a download ID; check Chrome Downloads before retrying.');
+      } catch {
+        // markUnverified has already updated the in-memory row. A later queue
+        // write retries it; a cold restart also treats a missing ID as unknown.
+      }
+      return outcome;
+    }
+    try {
+      await this.persist();
+    } catch {
+      item.error = 'Chrome started the download, but tracking could not be saved. Check Chrome Downloads before retrying.';
+      item.errorKind = 'unknown';
+    }
+    // The completion event can precede the ID write; an immediate search closes
+    // that race and also retries a transient persistence failure.
+    try {
       await this.handleDownloadChanged(outcome.downloadId);
+    } catch {
+      if (item.status === 'running') {
+        item.error = 'Chrome started the download, but tracking could not be saved. Check Chrome Downloads before retrying.';
+        item.errorKind = 'unknown';
+      }
     }
     return outcome;
   }
@@ -820,6 +865,7 @@ export class DownloadQueue {
     item.historyEntry = this.historyFor(item, server, post, path.fullPath);
     await this.startBrowser(item, {
       url: target, filename: path.fullPath, conflictAction: settings.duplicateBehaviour === 'overwrite' ? 'overwrite' : 'uniquify',
+      headers: postDownloadAuth(server, post, target),
     });
   }
 

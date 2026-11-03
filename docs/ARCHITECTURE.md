@@ -14,7 +14,7 @@ actions. Every surface talks to those services through one message protocol.
                                 │ UiRequest / RouterResponse  (message protocol)
 ┌───────────────────────────────▼─────────────────────────────────────┐
 │                        core/router.ts                               │
-│  one closure: translate UI intent → services; sanitise every reply  │
+│  one closure: translate UI intent → services; shape replies          │
 └──┬──────────┬───────────┬───────────┬───────────┬───────────┬───────┘
    │          │           │           │           │           │
 ┌──▼───┐ ┌────▼────┐ ┌────▼────┐ ┌────▼────┐ ┌────▼─────┐ ┌───▼──────┐
@@ -34,7 +34,7 @@ actions. Every surface talks to those services through one message protocol.
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │ BooruAdapter contract
 ┌───────────────────────────────▼─────────────────────────────────────┐
-│              adapters: e621 · danbooru · gelbooru (+ forks)          │
+│ adapters: booru families · Hydrus · Pawchive                         │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -51,7 +51,9 @@ actions. Every surface talks to those services through one message protocol.
 
 `HttpClient` handles API network I/O; Chrome downloads and UI thumbnails also
 contact remote hosts. Each HTTP snapshot carries a `redactedUrl`, and its event
-stream is redacted before it is emitted.
+stream is redacted before it is emitted. The internal snapshot's raw `url`,
+headers and response body can contain secrets and must not be logged or displayed
+without sanitization.
 
 ### 2. `src/core/` — shared services
 
@@ -123,15 +125,17 @@ script is a shadow-DOM button that sends one `posts/download` request.
 | `browse.ts`, `queue-view.ts` | options, popup | wide-layout grid and table views |
 | `settings-sections.ts` | options, panel | **the** settings screen: sectioned, one hint per option, shared markup |
 | `settings-view.ts` | options | thin adapter over `settings-sections.ts` |
-| `diagnostics-view.ts` | options, panel | adapter catalog, environment, credential-free validation traces |
+| `diagnostics-view.ts` | options, panel | adapter catalog, environment and redacted validation traces; review reports before sharing |
 | `panel-context.ts` | panel | "which page am I on?" card + the single-post card |
 | `panel-listing.ts` | panel | fetch card: search box, page range, media filter, crawl progress |
 | `panel-queue.ts` | panel | the row list (summary, toolbars, rows) and the fixed dock |
 | `panel/panel.ts` | panel | the controller: state, message calls, polling, tab routing |
 
-The panel is documented in [SIDEPANEL.md](SIDEPANEL.md). It renders masked views
-only and drives every action through the same `UiRequest`s the options page uses,
-so a panel-only feature cannot bypass validation, rating filters or rate limits.
+The panel is documented in [SIDEPANEL.md](SIDEPANEL.md). It uses the same
+`UiRequest`s as the options page for API actions; server profiles are masked.
+New Hydrus URLs omit the key and use header authentication, but mirror links and
+other site data may contain secrets. Chrome Downloads header redirect/storage
+behavior remains unverified. See [SECURITY.md](SECURITY.md).
 
 ## Message protocol
 
@@ -146,7 +150,7 @@ links/    list · posts · scanPost · queue · remove · clear · export · imp
           (the Links tab: one listing page → one scan per post → durable list)
 tasks/    list · begin · import · export · run · pause · rescan · remove
           (one task per creator: start it, pause it, rescan it, package it)
-posts/    get · resolveUrl · download
+posts/    get · thumbnail · resolveUrl · download
 routes/   detect
 queue/    list · enqueue · enqueuePosts · enqueuePawchivePost · enqueueLinks · run · pause · resume
           retryFailed · clear · cancel · remove
@@ -159,9 +163,13 @@ diagnostics/info · userAgent/sync
 
 Rules enforced by the router:
 
-- Server credentials cross the boundary only as `ServerConfigView`
-  (`apiKeyMask` + `hasApiKey`). Collected share URLs intentionally retain their
-  fragments and may contain private keys; exports are sensitive.
+- Server profile responses use `ServerConfigView` (`apiKeyMask` + `hasApiKey`).
+  Hydrus URLs are key-free and the authenticated thumbnail route accepts only
+  profile/file IDs; collected share URLs still retain private fragments, and
+  arbitrary site data may contain secrets.
+- Only read-like messages are automatically replayed after a lost response.
+  A mutation with an uncertain response tells the caller to inspect state rather
+  than risking a duplicate download or other repeated action.
 - `queue/run` and `queue/resume` are fire-and-forget; the UI polls
   `queue/list` (1.5 s in the options page, 1.2 s in the side panel) so a long
   download never blocks a message channel. `queue/run` takes an optional
@@ -214,7 +222,8 @@ posts/download { url | postId, serverId? }
   ├─ enforce rating filter (if enabled in settings)
   ├─ requireOriginalFile (never substitute sample or preview)
   ├─ buildDownloadPath (templates → sanitised folder + filename)
-  └─ Downloader.download → chrome.downloads (conflictAction: uniquify)
+  └─ queue persists start intent → chrome.downloads (configured conflict action)
+     → save browser ID → reconcile complete/interrupted/unverified
 ```
 
 **Batch download**
@@ -255,8 +264,8 @@ queue/run, link row → reject known provider share pages → buildMirrorPath
 
 ```
 tasks/begin   { serverId, query } → one task per site:service:creator (merged)
-tasks/run     { taskId, mode }    → planTaskRun: 'missing' queues new + failed,
-                                    never 'done'; enqueueLinks + record a run
+tasks/run     { taskId, mode }    → planTaskRun: 'missing' queues new + failed +
+                                    unverified, never 'done'; record a run
 tasks/pause   { taskId }          → drop that task's pending rows (bsm.links
                                     'queued' → 'new'), close the run if settled
 tasks/rescan  { taskId }          → list the creator, skip scannedPosts, collect,
@@ -294,7 +303,8 @@ Queue, link, task and history `done` require Chrome's `complete` state; interrup
 are retryable failures. A completion is not a byte/hash or content check, and the
 file may later disappear. Side effects are written idempotently and failed notebook
 writes are retried without another download. Pawchive metadata and file-start
-pacing are shared across aliases; active transfers are not capped. Old Pawchive
+pacing are shared across aliases while the worker's in-memory limiters are alive;
+worker restart resets pacing and active transfers are not capped. Old Pawchive
 queue indices are blocked until removed/re-added; expected file hashes on new rows
 detect metadata changes, not byte integrity. Mega fragments are kept in
 stored/exported links and redacted in diagnostic URLs.
@@ -314,9 +324,14 @@ MV3 workers are killed aggressively, so the worker owns no durable state:
   The panel polls search for byte progress because `onChanged` does not stream it;
 - cancellation requests call Chrome, and active rows cannot be removed or cleared.
 
-The UI never talks to an adapter or the network directly; it only sends messages.
-In the preview harness the same router runs in the page, but downloads and their
-completion are simulated: a web page cannot observe Chrome extension download state.
+API actions go through the message router; non-Hydrus UI images can request
+remote thumbnails directly. Hydrus thumbnails use bounded, redirect-rejecting
+worker fetches; originals pass a transient header to Chrome Downloads after an
+exact-target check. Redirect/header storage behavior in Chrome Downloads is not
+yet verified. In the preview harness the same router runs in the page; downloads
+and their completion are simulated, not observed from Chrome. If a service-worker
+Blob fallback is needed but `URL.createObjectURL` is unavailable, the original
+start error is surfaced rather than a fake fallback.
 
 ## User-Agent strategy
 
@@ -326,8 +341,9 @@ guidance) require a descriptive, non-browser UA:
 1. `effectiveUserAgent(adapter, server)` prefers the profile's custom UA, then the
    adapter's generated hint (`BooruServerManager/<version> (by <user> on <site>)`).
 2. `syncUserAgentRules()` mirrors those strings into `declarativeNetRequest`
-   dynamic rules — one `modifyHeaders` rule per saved server host, applied to
-   `xmlhttprequest` only.
+   dynamic rules — one `modifyHeaders` rule per saved server domain, applied to
+   `xmlhttprequest` requests. These rules also match subdomains and currently have
+   no initiator restriction, so they may affect non-extension requests.
 3. e621 additionally documents a `_client=<user agent>` query fallback, which the
    adapter appends when the probe/tests or the user's settings call for it
    (`sendClientParam`).
@@ -345,9 +361,14 @@ Both paths are optional and visible in *Settings → User-Agent handling*.
 | `tests/core/validation.test.ts` | Preflight, endpoint mismatch, auth vs blocked, rate limiting, network failure, trace redaction |
 | `tests/core/queue.test.ts` | De-duplication, rating enforcement, failure recording, pause/retry/clear, persistence, concurrency |
 | `tests/core/http.test.ts` | Rate limiter spacing, retries, abort, redaction, JSON/HTML/empty-body handling, taxonomy |
-| `tests/core/router.test.ts` | The whole message protocol against the mock booru APIs, including secret masking in every response |
+| `tests/core/router.test.ts` | Message protocol against mock APIs and server-view masking (not a blanket guarantee for every URL) |
+| `tests/core/download-completion.test.ts` | Browser completion/restart and storage-failure handling using mocked Chrome APIs |
+| `tests/core/request-policy.test.ts` | API attempts and validation/search rate-policy wiring |
+| `tests/core/platform.test.ts`, `content-button.test.ts` | Lost-message response and no-replay behavior |
+| `tests/core/preview-server.test.ts` | Harness allowlist, traversal and symlink checks |
 | `tests/core/links.test.ts` | Link rules, payload extraction, export/import round-trip, the link store's merge rules, `link` queue rows and the whole `links/*` flow against the mock creator archive |
 | `tests/core/tasks.test.ts` | Task identity, statistics/completion, run planning (new + retries, never re-download), the package round-trip between two machines, pause/rescan, and run history |
 
-All suites run offline: `tests/helpers.ts` wires the real service graph against
-`MemoryStorageArea`, a recording downloader and the mock booru fetch.
+All suites run without live external services: `tests/helpers.ts` wires the real
+service graph against `MemoryStorageArea`, a recording downloader and a mock
+fetch. The preview-server test starts a temporary local HTTP process.

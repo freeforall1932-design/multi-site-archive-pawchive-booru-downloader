@@ -1,9 +1,10 @@
-import { beforeEach, describe, expect, it } from 'vitest';
-import { ServerStore, toServerView } from '../../src/core/servers.js';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ServerStore, createServerConfig, isUsableServer, toServerView } from '../../src/core/servers.js';
 import { MemoryStorageArea } from '../../src/core/storage.js';
 import { registerBuiltinAdapters } from '../../src/adapters/index.js';
 import { BooruError } from '../../src/shared/errors.js';
 import { maskSecret } from '../../src/shared/util.js';
+import { createHarness } from '../helpers.js';
 
 registerBuiltinAdapters();
 
@@ -79,6 +80,26 @@ describe('ServerStore - secrets handling', () => {
     expect(updated.label).toBe('Renamed');
   });
 
+  it('does not carry a masked key to a changed server URL or site type', async () => {
+    const saved = await store.save({ siteType: 'e621', baseUrl: 'https://e621.net', username: 'u', apiKey: 'old-secret' });
+    await expect(store.save({ id: saved.id, baseUrl: 'https://other.example', apiKey: '' })).rejects.toMatchObject({ kind: 'incomplete-config' });
+    await expect(store.save({ id: saved.id, siteType: 'danbooru', baseUrl: 'https://danbooru.donmai.us', apiKey: '' })).rejects.toMatchObject({ kind: 'incomplete-config' });
+    expect(await store.get(saved.id)).toMatchObject({ baseUrl: 'https://e621.net', apiKey: 'old-secret' });
+    await store.clearCredentials(saved.id);
+    expect((await store.save({ id: saved.id, baseUrl: 'https://other.example', apiKey: '' })).apiKey).toBe('');
+  });
+
+  it('does not reuse a stored key to validate a changed URL', async () => {
+    const harness = createHarness();
+    const saved = await harness.servers.save({ siteType: 'e621', baseUrl: 'https://e621.net', username: 'u', apiKey: 'old-secret' });
+    const request = vi.spyOn(harness.http, 'request');
+    const result = await harness.router({ type: 'servers/validateDraft', payload: { server: { id: saved.id, siteType: 'e621', baseUrl: 'https://other.example', username: 'u', apiKey: '' } } });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe('incomplete-config');
+    expect(request).not.toHaveBeenCalled();
+    expect((await harness.servers.get(saved.id))?.apiKey).toBe('old-secret');
+  });
+
   it('replaces the key when a new one is provided', async () => {
     const saved = await store.save({ siteType: 'e621', baseUrl: 'https://e621.net', apiKey: 'old' });
     const updated = await store.save({ ...saved, apiKey: 'new' });
@@ -94,11 +115,68 @@ describe('ServerStore - secrets handling', () => {
     expect('apiKey' in view).toBe(false);
   });
 
-  it('can wipe credentials without losing the profile', async () => {
+  it('rejects URL userinfo and masks it in legacy views and secret-free exports', async () => {
+    await expect(store.save({ siteType: 'e621', baseUrl: 'https://user:private-pass@e621.net' })).rejects.toMatchObject({ kind: 'incomplete-config' });
+    const legacy = createServerConfig({ siteType: 'e621', baseUrl: 'https://user:private-pass@e621.net', apiKey: 'api-secret' });
+    const area = new MemoryStorageArea({ 'bsm.servers': [legacy] });
+    const oldStore = new ServerStore(area);
+    expect(isUsableServer(legacy)).toBe(false);
+    const view = (await oldStore.listViews())[0]!;
+    expect(view.baseUrl).not.toContain('private-pass');
+    expect(JSON.stringify(view)).not.toContain('api-secret');
+    const exported = await oldStore.exportServers();
+    expect(exported).not.toContain('private-pass');
+    expect(exported).not.toContain('api-secret');
+    expect((await oldStore.exportServers({ includeSecrets: true }))).toContain('private-pass');
+    const harness = createHarness();
+    await harness.area.set('bsm.servers', [legacy]);
+    await expect(harness.client.resolve(legacy.id)).rejects.toMatchObject({ kind: 'incomplete-config' });
+    const diagnostics = await harness.router({ type: 'diagnostics/info' });
+    expect(JSON.stringify(diagnostics)).not.toContain('private-pass');
+  });
+
+  it('can wipe credentials without losing the profile or retaining stale validation', async () => {
     const saved = await store.save({ siteType: 'e621', baseUrl: 'https://e621.net', apiKey: 'x' });
+    await store.updateValidation(saved.id, {
+      kind: 'ok', ok: true, endpointOk: true, authOk: true, message: 'authenticated', warnings: [], account: null,
+      checkedAt: new Date().toISOString(), httpStatus: 200, durationMs: 1, trace: [],
+    });
     const cleared = await store.clearCredentials(saved.id);
     expect(cleared?.apiKey).toBe('');
     expect(cleared?.baseUrl).toBe('https://e621.net');
+    expect(cleared?.validationStatus).toBe('unknown');
+    expect(cleared?.validationMessage).toBe('');
+    expect(cleared?.lastValidatedAt).toBeNull();
+  });
+
+  it('does not lose simultaneous profile saves', async () => {
+    const area = new MemoryStorageArea();
+    const concurrent = new ServerStore(area);
+    await Promise.all([
+      concurrent.save({ siteType: 'e621', baseUrl: 'https://e621.net', label: 'First' }),
+      concurrent.save({ siteType: 'danbooru', baseUrl: 'https://danbooru.donmai.us', label: 'Second' }),
+    ]);
+    const profiles = await new ServerStore(area).list();
+    expect(profiles.map((entry) => entry.label).sort()).toEqual(['First', 'Second']);
+    expect(profiles.filter((entry) => entry.isDefault)).toHaveLength(1);
+  });
+});
+
+describe('ServerStore - stale validation', () => {
+  it('does not mark a changed profile valid after an older probe finishes', async () => {
+    const harness = createHarness();
+    const profile = await harness.servers.save({ siteType: 'e621', baseUrl: 'https://e621.net', username: 'user', apiKey: 'old' });
+    let finish!: (value: Awaited<ReturnType<typeof harness.validation.validate>>) => void;
+    const probe = new Promise<Awaited<ReturnType<typeof harness.validation.validate>>>((resolve) => { finish = resolve; });
+    const validate = vi.spyOn(harness.validation, 'validate').mockReturnValue(probe);
+    const pending = harness.client.validateServer(profile.id);
+    await vi.waitFor(() => expect(validate).toHaveBeenCalledTimes(1));
+    await harness.servers.save({ id: profile.id, apiKey: 'new' });
+    finish({ kind: 'ok', ok: true, endpointOk: true, authOk: true, message: 'old key accepted', warnings: [], account: null,
+      checkedAt: new Date().toISOString(), httpStatus: 200, durationMs: 1, trace: [] });
+    const result = await pending;
+    expect(result).toMatchObject({ ok: false, kind: 'incomplete-config' });
+    expect((await harness.servers.get(profile.id))?.validationStatus).toBe('unknown');
   });
 });
 
@@ -130,6 +208,18 @@ describe('ServerStore - duplicate, delete, validation bookkeeping', () => {
     expect(copy.validationStatus).toBe('unknown');
     expect(copy.lastValidatedAt).toBeNull();
     expect(copy.isDefault).toBe(false);
+  });
+
+  it('requires an explicit key choice when duplicating to a different target', async () => {
+    const original = await store.save({ siteType: 'e621', baseUrl: 'https://e621.net', apiKey: 'old-key' });
+    await expect(store.duplicate(original.id, { baseUrl: 'https://other.example' }))
+      .rejects.toMatchObject({ kind: 'incomplete-config' });
+    const cleared = await store.duplicate(original.id, { baseUrl: 'https://other.example', apiKey: '' });
+    expect(cleared.baseUrl).toBe('https://other.example');
+    expect(cleared.apiKey).toBe('');
+    const replaced = await store.duplicate(original.id, { baseUrl: 'https://other.example', apiKey: 'new-key' });
+    expect(replaced.apiKey).toBe('new-key');
+    expect((await store.get(original.id))?.apiKey).toBe('old-key');
   });
 
   it('promotes a new default when the default profile is deleted', async () => {

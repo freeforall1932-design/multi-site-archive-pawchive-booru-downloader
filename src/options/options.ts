@@ -19,11 +19,12 @@ import type {
   ServerConfigView,
   ValidationResult,
 } from '../shared/types.js';
-import { h, clear, button } from '../ui/dom.js';
+import { h, clear, button, preserveInputFocus } from '../ui/dom.js';
+import { OrderedUpdates } from '../ui/ordered-updates.js';
 import { renderBrowse, type BrowseState } from '../ui/browse.js';
 import { renderDiagnostics, copyDiagnostics } from '../ui/diagnostics-view.js';
 import { renderQueue, type QueueState } from '../ui/queue-view.js';
-import { renderServerForm, draftForSiteType, draftFromServer, type ServerFormDraft, type ServerFormState } from '../ui/server-form.js';
+import { renderServerForm, draftForSiteType, draftFromServer, draftSaveDecision, draftValidationSignature, withSiteDefaults, type ServerFormDraft, type ServerFormState } from '../ui/server-form.js';
 import { renderServerList, type ServerListState } from '../ui/server-list.js';
 import { renderSettings, type SettingsState } from '../ui/settings-view.js';
 import { showError, toast } from '../ui/toast.js';
@@ -190,7 +191,8 @@ function renderNav(): void {
 // --------------------------------------------------------------------- render
 
 async function render(): Promise<void> {
-  root.replaceChildren();
+  // Individual views replace their own content. Clearing here first would
+  // destroy a focused editor before its focus-preserving render can run.
   switch (state.view) {
     case 'servers':
       return renderServers();
@@ -210,13 +212,14 @@ async function render(): Promise<void> {
 }
 
 function renderServers(): void {
+  if (state.view !== 'servers') return;
   const listState: ServerListState = {
     servers: state.servers,
     adapters: state.adapters,
     busyId: state.busyId,
     filter: state.listFilter,
   };
-  renderServerList(root, listState, {
+  preserveInputFocus(root, () => renderServerList(root, listState, {
     onAdd: (siteType) => openEditor(null, siteType),
     onEdit: (server) => openEditor(server),
     onDuplicate: async (server) => {
@@ -261,10 +264,11 @@ function renderServers(): void {
       renderServers();
     },
     onOpenQueue: () => navigate('queue'),
-  });
+  }));
 }
 
 function renderEditor(): void {
+  if (state.view !== 'editor') return;
   const editor = state.editor;
   if (!editor) {
     void navigate('servers');
@@ -285,58 +289,76 @@ function renderEditor(): void {
       : '',
     validation: editor.validation,
     validating: editor.validating,
-    validatedCurrentValues: signature(editor.draft) === editor.validatedSignature,
+    validatedCurrentValues: draftValidationSignature(editor.draft) === editor.validatedSignature,
     saving: editor.saving,
   };
-  renderServerForm(root, formState, {
+  preserveInputFocus(root, () => renderServerForm(root, formState, {
     onChange: (patch) => {
+      if (editor.saving) return;
+      const before = draftValidationSignature(editor.draft);
       const previousSiteType = editor.draft.siteType;
-      Object.assign(editor.draft, patch);
+      editor.draft = { ...editor.draft, ...patch };
       if (patch.siteType && patch.siteType !== previousSiteType) {
-        const next = state.adapters.find((entry) => entry.siteType === patch.siteType);
-        editor.draft.baseUrl = next?.baseUrl ?? '';
-        editor.draft.label = next?.displayName ?? patch.siteType;
-        editor.draft.allowedRatings = next?.defaultRatings ?? [];
-        editor.draft.ratingFilterEnabled = next?.supportsRatingFilter ?? true;
-        editor.draft.customUserAgent = '';
-        editor.draft.username = '';
-        editor.draft.userId = '';
-        editor.draft.apiKey = '';
+        editor.draft = withSiteDefaults(editor.draft, patch.siteType, state.adapters);
+        editor.apiKeyMask = '';
+      }
+      if (draftValidationSignature(editor.draft) !== before) {
+        editor.validation = null;
+        editor.validatedSignature = null;
       }
       renderEditor();
     },
     onValidate: async () => {
       editor.validating = true;
       editor.validation = null;
+      editor.validatedSignature = null;
+      const draft = { ...editor.draft };
+      const submitted = draftValidationSignature(draft);
       renderEditor();
       const result = await send<ValidationResult>({
         type: 'servers/validateDraft',
-        payload: { server: { ...editor.draft, ...(editor.isNew ? {} : { id: editor.draft.id }) } },
+        payload: { server: { ...draft, ...(editor.isNew ? {} : { id: draft.id }) } },
       });
+      if (state.editor !== editor) return;
       editor.validating = false;
-      if (result) {
+      if (result && draftValidationSignature(editor.draft) === submitted) {
         editor.validation = result;
-        editor.validatedSignature = signature(editor.draft);
+        editor.validatedSignature = submitted;
         toast(result.ok ? 'Validation succeeded' : `Validation failed: ${result.message}`, result.ok ? 'success' : 'error', 6000);
+      } else if (result) {
+        toast('The connection changed during validation. Validate the current values again.', 'warning', 6000);
       }
       renderEditor();
     },
     onSave: async ({ force }) => {
-      if (!editor.isNew && !editor.validation && !force) {
-        // "Validation must happen before or during save": run it automatically.
+      if (editor.saving || editor.validating) return;
+      const decision = draftSaveDecision(editor, force);
+      if (decision === 'blocked') {
+        toast('Validation failed. Use "Save anyway" to store these values.', 'warning', 6000);
+        return;
+      }
+      if (decision === 'validate') {
+        // Validate the submitted snapshot, not fields edited while the request is in flight.
         editor.validating = true;
+        editor.validation = null;
+        const draft = { ...editor.draft };
+        const submitted = draftValidationSignature(draft);
         renderEditor();
         const result = await send<ValidationResult>({
           type: 'servers/validateDraft',
-          payload: { server: { ...editor.draft, id: editor.draft.id } },
+          payload: { server: { ...draft, id: draft.id } },
         });
+        if (state.editor !== editor) return;
         editor.validating = false;
-        if (result) {
-          editor.validation = result;
-          editor.validatedSignature = signature(editor.draft);
+        if (!result || draftValidationSignature(editor.draft) !== submitted) {
+          renderEditor();
+          toast('Saved nothing: validation did not complete for the current values.', 'warning', 6000);
+          return;
         }
+        editor.validation = result;
+        editor.validatedSignature = submitted;
         renderEditor();
-        if (result && !result.ok) {
+        if (!result.ok) {
           toast('Saved nothing yet - validation failed. Use "Save anyway" to store it regardless.', 'warning', 6000);
           return;
         }
@@ -350,6 +372,7 @@ function renderEditor(): void {
           ...(editor.isNew ? {} : { id: editor.draft.id }),
         },
       });
+      if (state.editor !== editor) return;
       editor.saving = false;
       if (saved) {
         toast(`Saved ${saved.label}`, 'success');
@@ -370,16 +393,19 @@ function renderEditor(): void {
         server: { username: editor.draft.username, userId: editor.draft.userId, customUserAgent: '' },
         baseUrl: editor.draft.baseUrl,
       });
+      editor.validation = null;
+      editor.validatedSignature = null;
       renderEditor();
     },
     onBackToList: () => {
       state.editor = null;
       navigate('servers');
     },
-  });
+  }));
 }
 
 function renderBrowseView(): void {
+  if (state.view !== 'browse') return;
   const browseState: BrowseState = {
     servers: state.servers.filter(isUsableServer),
     adapters: state.adapters,
@@ -395,7 +421,7 @@ function renderBrowseView(): void {
     page: state.browse.page,
     queueCount: state.queue.summary.total,
   };
-  renderBrowse(root, browseState, {
+  preserveInputFocus(root, () => renderBrowse(root, browseState, {
     onServerChange: (id) => {
       state.browse.serverId = id;
       state.browse.overrideRatingFilter = null;
@@ -485,7 +511,7 @@ function renderBrowseView(): void {
       state.browse.tags = [state.browse.tags.trim(), tag].filter(Boolean).join(' ');
       renderBrowseView();
     },
-  });
+  }));
 }
 
 async function runSearch(reset: boolean): Promise<void> {
@@ -530,6 +556,7 @@ async function runSearch(reset: boolean): Promise<void> {
 }
 
 function renderQueueView(): void {
+  if (state.view !== 'queue') return;
   const queueState: QueueState = {
     summary: state.queue.summary,
     items: state.queue.items,
@@ -567,8 +594,14 @@ function renderQueueView(): void {
   });
 }
 
+const settingsUpdates = new OrderedUpdates();
+
 function renderSettingsView(): void {
-  if (!state.settings) return;
+  if (state.view !== 'settings') return;
+  if (!state.settings) {
+    root.replaceChildren(h('p', { class: 'muted', text: 'Settings could not be loaded.' }));
+    return;
+  }
   void refreshHistoryCounts();
   const settingsState: SettingsState = {
     settings: state.settingsDraft ?? state.settings,
@@ -579,33 +612,43 @@ function renderSettingsView(): void {
     historyCount: state.historyCount,
     searchCount: state.searchCount,
   };
-  renderSettings(root, settingsState, {
+  preserveInputFocus(root, () => renderSettings(root, settingsState, {
     onChange: (patch) => {
       state.settingsDraft = { ...(state.settingsDraft ?? state.settings!), ...patch };
       renderSettingsView();
     },
     onSave: async () => {
-      const draft = state.settingsDraft;
-      if (!draft) return;
+      const draft = state.settingsDraft ?? state.settings;
+      if (!draft || state.settingsSaving) return;
       state.settingsSaving = true;
       renderSettingsView();
-      const saved = await send<ExtensionSettings>({ type: 'settings/save', payload: draft });
-      state.settingsSaving = false;
-      if (saved) {
-        state.settings = saved;
-        state.settingsDraft = null;
-        toast('Settings saved', 'success');
-      }
-      renderSettingsView();
+      await settingsUpdates.run(
+        () => send<ExtensionSettings>({ type: 'settings/save', payload: draft }),
+        (saved, isLatest) => {
+          state.settingsSaving = false;
+          if (saved && isLatest()) {
+            state.settings = saved;
+            // Edits made while this save was pending remain an unsaved draft.
+            if (state.settingsDraft === draft) state.settingsDraft = null;
+            toast('Settings saved', 'success');
+          }
+          renderSettingsView();
+        },
+      );
     },
     onReset: async () => {
-      const saved = await send<ExtensionSettings>({ type: 'settings/reset' });
-      if (saved) {
-        state.settings = saved;
-        state.settingsDraft = null;
-        toast('Settings reset to defaults', 'success');
-      }
-      renderSettingsView();
+      const draft = state.settingsDraft;
+      await settingsUpdates.run(
+        () => send<ExtensionSettings>({ type: 'settings/reset' }),
+        (saved, isLatest) => {
+          if (saved && isLatest()) {
+            state.settings = saved;
+            if (state.settingsDraft === draft) state.settingsDraft = null;
+            toast('Settings reset to defaults', 'success');
+          }
+          renderSettingsView();
+        },
+      );
     },
     onExport: async (includeSecrets) => {
       if (includeSecrets && !globalThis.confirm('Export INCLUDING API keys to a plain file? Keep it safe.')) return;
@@ -665,14 +708,20 @@ function renderSettingsView(): void {
       renderSettingsView();
     },
     onOpenServers: () => navigate('servers'),
-  });
+  }));
 }
 
 async function renderDiagnosticsView(): Promise<void> {
+  if (state.view !== 'diagnostics') return;
   if (!state.diagnostics) {
+    root.replaceChildren(h('p', { class: 'muted', text: 'Loading diagnostics…' }));
     state.diagnostics = await send<DiagnosticsInfo>({ type: 'diagnostics/info' });
   }
-  if (!state.diagnostics) return;
+  if (state.view !== 'diagnostics') return;
+  if (!state.diagnostics) {
+    root.replaceChildren(h('p', { class: 'muted', text: 'Diagnostics could not be loaded.' }));
+    return;
+  }
   renderDiagnostics(root, state.diagnostics, {
     onSyncUserAgent: async () => {
       const result = await send<{ ok: boolean; applied: number; error?: string }>({ type: 'userAgent/sync' });
@@ -713,17 +762,6 @@ function openEditor(server: ServerConfigView | null, siteType?: string): void {
     };
   }
   navigate('editor');
-}
-
-function signature(draft: ServerFormDraft): string {
-  return JSON.stringify({
-    siteType: draft.siteType,
-    baseUrl: draft.baseUrl,
-    username: draft.username,
-    apiKey: draft.apiKey,
-    userId: draft.userId,
-    customUserAgent: draft.customUserAgent,
-  });
 }
 
 async function refreshServers(): Promise<void> {

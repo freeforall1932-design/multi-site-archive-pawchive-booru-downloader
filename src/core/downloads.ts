@@ -1,8 +1,9 @@
 import { isPawchiveHost } from '../adapters/pawchive.js';
+import { hydrusAdapter, hydrusAuthHeaders, hydrusFileUrl } from '../adapters/hydrus.js';
 import { BooruError } from '../shared/errors.js';
 import { RateLimiter } from '../shared/http.js';
-import type { BooruPost } from '../shared/types.js';
-import { redactUrlsInText, safeUrl } from '../shared/util.js';
+import type { BooruPost, ServerConfig } from '../shared/types.js';
+import { normalizeBaseUrl, redactUrlsInText, safeUrl } from '../shared/util.js';
 
 /**
  * Resolve the site's original-file URL for every post download path. Previews
@@ -39,8 +40,25 @@ export function requireOriginalFile(post: BooruPost): string {
   return post.fileUrl;
 }
 
+/** Only attach a Hydrus key to the exact configured original-file endpoint. */
+export function postDownloadAuth(server: ServerConfig, post: BooruPost, target: string): Record<string, string> | undefined {
+  if (server.siteType !== 'hydrus') return undefined;
+  const base = normalizeBaseUrl(hydrusAdapter.normalizeBaseUrl!(server.baseUrl));
+  const parsed = safeUrl(base);
+  if (!parsed || !['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password ||
+      post.siteType !== 'hydrus' || post.serverId !== server.id || target !== hydrusFileUrl(base, post.id, 'file')) {
+    throw new BooruError('Refusing to send a Hydrus key to an unexpected file URL.', { kind: 'incomplete-config' });
+  }
+  if (!server.apiKey.trim() || /[\r\n]/.test(server.apiKey)) {
+    throw new BooruError('A valid Hydrus access key is required for downloads.', { kind: 'incomplete-config' });
+  }
+  return hydrusAuthHeaders(server.apiKey);
+}
+
 export interface DownloadRequest {
   url: string;
+  /** Volatile authentication headers; never add to queue/history or logs. */
+  headers?: Record<string, string>;
   /** Path relative to the browser's download directory. */
   filename: string;
   /** Avoid clobbering an existing file (default: uniquify). */
@@ -184,30 +202,37 @@ export interface ChromeDownloaderOptions {
 /**
  * Real downloads through `chrome.downloads`.
  *
- * The direct API call is preferred (browser handles retries/resume). If Chrome
- * rejects the URL - typically a media host the extension has no host permission
- * for - the file is fetched in the worker and saved from a blob URL instead.
+ * The direct API call is preferred (browser handles retries/resume). A blob
+ * fallback is possible only in a context that supports object URLs. MV3 service
+ * workers do not, so they report the direct error instead of fetching a whole
+ * file and failing when trying to create an object URL.
  */
 export class ChromeDownloader implements Downloader {
   private readonly fetchImpl: (input: string, init?: RequestInit) => Promise<Response>;
-  private readonly createObjectUrl: (blob: Blob) => string;
+  private readonly createObjectUrl: ((blob: Blob) => string) | null;
   private readonly revokeObjectUrl: (url: string) => void;
 
   constructor(options: ChromeDownloaderOptions = {}) {
     this.fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
-    this.createObjectUrl = options.createObjectUrl ?? ((blob) => URL.createObjectURL(blob));
-    this.revokeObjectUrl = options.revokeObjectUrl ?? ((url) => URL.revokeObjectURL(url));
+    this.createObjectUrl = options.createObjectUrl ?? (typeof URL.createObjectURL === 'function' ? (blob) => URL.createObjectURL(blob) : null);
+    this.revokeObjectUrl = options.revokeObjectUrl ?? ((url) => URL.revokeObjectURL?.(url));
   }
 
   async download(request: DownloadRequest): Promise<DownloadOutcome> {
     throwIfAborted(request.signal);
     try {
-      const downloadId = await this.direct(request.url, request.filename, request.conflictAction ?? 'uniquify');
+      const downloadId = await this.direct(request.url, request.filename, request.conflictAction ?? 'uniquify', request.headers);
       return { downloadId, viaFallback: false, bytes: null };
     } catch (error) {
       throwIfAborted(request.signal);
       const booruError = error instanceof BooruError ? error : null;
       if (booruError?.kind !== 'blocked' && booruError?.kind !== 'unknown') throw error;
+      if (!this.createObjectUrl) {
+        throw new BooruError(`${booruError.message}. Blob fallback is unavailable in this service worker.`, {
+          kind: booruError.kind,
+          hint: request.headers ? 'Check Chrome Downloads, the trusted Hydrus endpoint, and host access.' : 'Check Chrome Downloads and host access, or open the original URL in the browser.',
+        });
+      }
       return this.viaBlob(request);
     }
   }
@@ -235,15 +260,19 @@ export class ChromeDownloader implements Downloader {
     await downloads.cancel(downloadId);
   }
 
-  private async direct(url: string, filename: string, conflictAction: 'uniquify' | 'overwrite' | 'prompt'): Promise<number> {
+  private async direct(url: string, filename: string, conflictAction: 'uniquify' | 'overwrite' | 'prompt', headers?: Record<string, string>): Promise<number> {
     const downloads = globalThis.chrome?.downloads;
     if (!downloads) {
       throw new BooruError('chrome.downloads is unavailable', { kind: 'unknown' });
     }
     try {
-      return await downloads.download({ url, filename, conflictAction, saveAs: false });
+      return await downloads.download({
+        url, filename, conflictAction, saveAs: false,
+        ...(headers ? { headers: Object.entries(headers).map(([name, value]) => ({ name, value })) } : {}),
+      });
     } catch (error) {
-      const message = redactUrlsInText(error instanceof Error ? error.message : String(error));
+      let message = redactUrlsInText(error instanceof Error ? error.message : String(error));
+      for (const value of Object.values(headers ?? {})) if (value) message = message.split(value).join('***');
       const blocked = /permission|denied|not allowed|invalid url|forbidden/i.test(message);
       throw new BooruError(`chrome.downloads rejected the file: ${message}`, {
         kind: blocked ? 'blocked' : 'unknown',
@@ -255,9 +284,13 @@ export class ChromeDownloader implements Downloader {
   private async viaBlob(request: DownloadRequest): Promise<DownloadOutcome> {
     let response: Response;
     try {
-      response = await this.fetchImpl(request.url, { signal: request.signal, credentials: 'omit' });
+      response = await this.fetchImpl(request.url, {
+        signal: request.signal, credentials: 'omit', headers: request.headers,
+        redirect: request.headers ? 'error' : 'follow',
+      });
     } catch (error) {
-      const message = redactUrlsInText(error instanceof Error ? error.message : String(error));
+      let message = redactUrlsInText(error instanceof Error ? error.message : String(error));
+      for (const value of Object.values(request.headers ?? {})) if (value) message = message.split(value).join('***');
       throw new BooruError(`Media download failed: ${message}`, { kind: 'network-failure' });
     }
     if (!response.ok) {
@@ -268,7 +301,8 @@ export class ChromeDownloader implements Downloader {
     }
     const blob = await response.blob();
     throwIfAborted(request.signal);
-    const objectUrl = this.createObjectUrl(blob);
+    // download() only enters this path when object URLs are available.
+    const objectUrl = this.createObjectUrl!(blob);
     try {
       const downloadId = await this.direct(objectUrl, request.filename, request.conflictAction ?? 'uniquify');
       return { downloadId, viaFallback: true, bytes: blob.size };

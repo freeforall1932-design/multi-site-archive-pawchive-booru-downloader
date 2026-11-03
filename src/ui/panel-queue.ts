@@ -15,6 +15,7 @@ import type { QueueItem, QueueSummary, Rating, ServerConfigView } from '../share
 import { formatBytes, relativeTime } from '../shared/util.js';
 import { button, h } from './dom.js';
 import { kindLabel, ratingChip } from './format.js';
+import { postImage } from './post-image.js';
 
 export interface QueueRowView {
   item: QueueItem;
@@ -198,10 +199,9 @@ function queueRow(row: QueueRowView, state: QueueListState, callbacks: QueueList
 
   if (state.showThumbnails && !isLink) {
     element.appendChild(
-      row.thumbnail
-        ? h('img', {
+      row.server && (row.thumbnail || row.server.siteType === 'hydrus')
+        ? postImage({ serverId: item.serverId, id: item.postId, siteType: row.server.siteType, previewUrl: row.thumbnail, cacheScope: row.server.baseUrl }, {
             class: 'psThumb',
-            src: row.thumbnail,
             alt: '',
             loading: 'lazy',
             on: { error: (event) => (event.target as HTMLImageElement).classList.add('psBroken') },
@@ -225,7 +225,7 @@ function queueRow(row: QueueRowView, state: QueueListState, callbacks: QueueList
     );
   } else {
     title.appendChild(
-      item.postUrl
+      item.postUrl && row.server && row.server.siteType !== 'hydrus'
         ? h('a', {
             href: item.postUrl,
             target: '_blank',
@@ -242,6 +242,7 @@ function queueRow(row: QueueRowView, state: QueueListState, callbacks: QueueList
     title.appendChild(h('span', { class: `psTypeBadge${row.media === 'video' ? ' video' : ''}`, text: row.media === 'video' ? 'video' : 'pic' }));
     if (row.rating) title.appendChild(ratingChip(row.rating));
     if (row.server) title.appendChild(h('span', { class: 'psTypeBadge server', text: row.server.siteType }));
+    else title.appendChild(h('span', { class: 'psTypeBadge server', text: 'profile missing', title: 'Restore the server profile or remove this row.' }));
   }
   if (row.savedFilename) {
     title.appendChild(h('span', { class: 'psTypeBadge saved', text: 'completed', title: `Chrome reported complete: ${row.savedFilename}` }));

@@ -331,17 +331,25 @@ const hydrusMetadata = {
 describe('Hydrus adapter', () => {
   const ctx = ctxFor(hydrusAdapter, { apiKey: 'abc123' });
 
+  it('warns about redirect uncertainty and previously exposed keys', () => {
+    expect(hydrusAdapter.capabilities.notes.join(' ')).toMatch(/redirects.*not been verified/i);
+    expect(hydrusAdapter.capabilities.notes.join(' ')).toMatch(/older versions.*keys.*history/i);
+    expect(hydrusAdapter.credentialFields()[0]?.help).toMatch(/restricted key.*redirects/i);
+  });
+
   it('normalizes the base URL to plain http on localhost', () => {
     expect(hydrusAdapter.normalizeBaseUrl!('127.0.0.1:45869/')).toBe('http://127.0.0.1:45869');
     expect(ctx.baseUrl).toBe('http://127.0.0.1:45869');
   });
 
-  it('builds search_files with a JSON tag list and the key as a query parameter', () => {
-    const url = new URL(hydrusAdapter.buildSearchRequest(ctx, { tags: 'blue eyes, -tagme', limit: 100, page: 1 }).url);
+  it('uses an authentication header and rejects redirects for search', () => {
+    const request = hydrusAdapter.buildSearchRequest(ctx, { tags: 'blue eyes, -tagme', limit: 100, page: 1 });
+    const url = new URL(request.url);
     expect(url.pathname).toBe('/get_files/search_files');
     expect(JSON.parse(url.searchParams.get('tags')!)).toEqual(['blue eyes', '-tagme']);
-    expect(url.searchParams.get('Hydrus-Client-API-Access-Key')).toBe('abc123');
-    expect(redactUrl(url.toString())).not.toContain('abc123');
+    expect(url.toString()).not.toContain('abc123');
+    expect(request.headers?.['Hydrus-Client-API-Access-Key']).toBe('abc123');
+    expect(request.redirect).toBe('error');
     expect(composeHydrusTags('', '')).toEqual(['system:everything']);
   });
 

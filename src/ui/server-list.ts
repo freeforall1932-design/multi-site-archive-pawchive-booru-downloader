@@ -57,6 +57,7 @@ export function renderServerList(container: HTMLElement, state: ServerListState,
       state.servers.length
         ? h('input', {
             class: 'search-input',
+            id: 'server-filter',
             type: 'search',
             placeholder: 'Filter servers…',
             value: state.filter,
@@ -98,7 +99,7 @@ function emptyState(adapters: AdapterCatalogEntry[], callbacks: ServerListCallba
         button(`Add ${adapter.displayName}`, { onClick: () => callbacks.onAdd(adapter.siteType) }),
       ),
     ),
-    h('p', { class: 'muted small', text: 'Credentials are stored in chrome.storage.local and only sent to the site you configured.' }),
+    h('p', { class: 'muted small', text: 'Credentials are stored locally and used for configured sites. Review the security notes, especially for redirects and HTTP.' }),
   );
 }
 

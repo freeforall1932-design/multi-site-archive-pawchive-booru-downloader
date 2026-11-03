@@ -2,8 +2,8 @@
  * MV3 background service worker.
  *
  * Responsibilities:
- *  - own every network request (the extension has host permissions, pages do not)
- *  - own stored credentials (the UI only ever receives masked views)
+ *  - handle API requests (images and Chrome Downloads can also contact hosts)
+ *  - own stored profile credentials (server views are masked; typed drafts are not)
  *  - answer UI/content-script messages through the shared router
  *  - keep declarativeNetRequest User-Agent rules in sync with saved servers
  *
@@ -53,6 +53,8 @@ globalThis.chrome?.downloads?.onErased?.addListener((id) => {
   void queue.handleDownloadChanged(id).catch(() => console.warn('[booru] erased download reconciliation failed; it will be retried.'));
 });
 void queue.recover().catch(() => console.warn('[booru] queue recovery failed; open the queue to retry.'));
+// Clean old Hydrus key-bearing history URLs even before the notebook is opened.
+void history.list().catch(() => console.warn('[booru] history cleanup failed; opening history will retry it.'));
 
 const handle = createRouter({
   client,

@@ -17,6 +17,7 @@ import { isUsableServer, type ServerStore } from './servers.js';
 import type { SettingsStore } from './settings.js';
 import type { ValidationService } from './validation.js';
 import { requestRateKey } from './request-policy.js';
+import { hydrusAuthHeaders, hydrusFileUrl } from '../adapters/hydrus.js';
 
 export interface BooruClientDeps {
   servers: ServerStore;
@@ -64,7 +65,16 @@ export class BooruClient {
 
   async resolve(explicitId?: string | null): Promise<ResolvedTarget> {
     const server = await this.resolveServer(explicitId);
-    return { server, adapter: requireAdapter(server.siteType) };
+    const adapter = requireAdapter(server.siteType);
+    if (!isUsableServer(server)) {
+      // Preserve site-specific diagnostics where available, but never send
+      // requests from a legacy profile with an invalid or credential-bearing URL.
+      adapter.normalizeBaseUrl?.(server.baseUrl);
+      throw new BooruError('This server URL is invalid or contains embedded credentials.', {
+        kind: 'incomplete-config', hint: 'Edit the profile and remove credentials from its URL.',
+      });
+    }
+    return { server, adapter };
   }
 
   /** Does the route rating filter apply to this post? */
@@ -97,6 +107,7 @@ export class BooruClient {
     const snapshot = await this.deps.http.request(request, {
       rateKey: requestRateKey(server),
       minIntervalMs: Math.max(settings.minRequestIntervalMs, adapter.capabilities.minRequestIntervalMs),
+      maxAttempts: settings.maxRetries,
     });
     return adapter.parseSearchResponse(snapshot, fullSpec, ctx);
   }
@@ -109,8 +120,31 @@ export class BooruClient {
     const snapshot = await this.deps.http.request(request, {
       rateKey: requestRateKey(server),
       minIntervalMs: Math.max(settings.minRequestIntervalMs, adapter.capabilities.minRequestIntervalMs),
+      maxAttempts: settings.maxRetries,
     });
     return adapter.parsePostResponse(snapshot, postId, ctx);
+  }
+
+  /** Fetch only a configured Hydrus thumbnail by ID; callers cannot supply a URL or key. */
+  async getHydrusThumbnail(serverId: string, postId: string): Promise<string> {
+    const { server, adapter } = await this.resolve(serverId);
+    if (server.siteType !== 'hydrus') {
+      throw new BooruError('Authenticated thumbnails are only available for Hydrus profiles.', { kind: 'unsupported-site' });
+    }
+    if (!server.apiKey.trim() || /[\r\n]/.test(server.apiKey)) {
+      throw new BooruError('A valid Hydrus access key is required for thumbnails.', { kind: 'incomplete-config' });
+    }
+    const settings = await this.deps.settings.get();
+    const ctx = createAdapterContext(adapter, server, settings);
+    return this.deps.http.requestImage({
+      url: hydrusFileUrl(ctx.baseUrl, postId, 'thumbnail'),
+      headers: hydrusAuthHeaders(server.apiKey),
+      redirect: 'error', tag: 'hydrus',
+    }, {
+      rateKey: requestRateKey(server),
+      minIntervalMs: Math.max(settings.minRequestIntervalMs, adapter.capabilities.minRequestIntervalMs),
+      maxBytes: 1024 * 1024,
+    });
   }
 
   /**
@@ -130,6 +164,7 @@ export class BooruClient {
     const snapshot = await this.deps.http.request(request, {
       rateKey: requestRateKey(server),
       minIntervalMs: Math.max(settings.minRequestIntervalMs, adapter.capabilities.minRequestIntervalMs),
+      maxAttempts: settings.maxRetries,
     });
     const failure = adapter.classifyFailure?.(snapshot) ?? null;
     if (failure) {
@@ -142,7 +177,11 @@ export class BooruClient {
     const server = await this.resolveServer(serverId);
     const settings = await this.deps.settings.get();
     const result = await this.deps.validation.validate(server, settings);
-    await this.deps.servers.updateValidation(server.id, result);
+    const updated = await this.deps.servers.updateValidation(server.id, result, server);
+    if (!updated) {
+      return { ...result, ok: false, kind: 'incomplete-config', endpointOk: null, authOk: null, account: null,
+        message: 'The server profile changed or was removed during validation; validate the current profile again.', trace: [] };
+    }
     return result;
   }
 

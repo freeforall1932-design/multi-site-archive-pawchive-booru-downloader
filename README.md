@@ -51,8 +51,8 @@ The design and every setting are documented in
   segmented control, an original-only indicator and *Download selected*.
 - **Links** — the mirror-link collector, organised as **download tasks**: walks a
   creator's posts through the Pawchive API and
-  keeps every off-site download link it finds (Drive, Mega, MediaFire, …) as one
-  task per creator. A task shows how many transfers Chrome completed, which failed,
+  keeps matching off-site download links it finds (Drive, Mega, MediaFire, …) in
+  one task per creator, subject to page limits, failures and filter settings. A task shows how many transfers Chrome completed, which failed,
   when it last ran, and offers *Download missing* (new files **and** retries),
   *Rescan* (new uploads), *Pause* and *Export package*. The package — a `.json`
   manifest plus the grouped `.txt` list — can be sent to someone else, who opens
@@ -176,7 +176,7 @@ rating filter is spelled `-explicit` etc.
 
 | `siteType` | Site | Auth | Notes |
 | --- | --- | --- | --- |
-| `hydrus` | your Hydrus client, `http://127.0.0.1:45869` | Client API access key (**required**, needs *search for and fetch files*) | Comma-separated Hydrus tags, `system:` predicates work; listing pages the id list locally and fetches `file_metadata` per file before download; no ratings |
+| `hydrus` | your Hydrus client, `http://127.0.0.1:45869` | Client API access key (**required**, needs *search for and fetch files*) | Comma-separated Hydrus tags; no ratings. New URLs omit the key; authenticated originals use a Chrome Downloads header whose redirect/storage behavior is unverified. Use a trusted direct endpoint and restricted key. See [security notes](docs/SECURITY.md). |
 
 ### Pawchive (creator archive, not a tag booru)
 
@@ -230,7 +230,8 @@ Existing skip-by-history preferences are preserved.
 
 **Transfer limits and status:** metadata requests share at least a 1.5-second
 interval across Pawchive profiles; file-download *starts* are at least one second
-apart. This does not cap active Chrome transfers. The queue persists Chrome's
+apart while the worker and its in-memory limiter remain active. Pacing state is
+not persisted across worker restarts. This does not cap active Chrome transfers. The queue persists Chrome's
 download ID and follows `complete`/`interrupted` events, including after a worker
 restart; byte progress is read from Chrome while the panel is open. Direct post,
 queued post, and direct mirror downloads all use this tracking. Cancel requests
@@ -295,7 +296,7 @@ smoke test in one go.
 
 | Site | Where |
 | --- | --- |
-| e621 | Account → *Manage API Access* (key). Put your e621 username in the username field: e621 policy requires a descriptive User-Agent that identifies you, e.g. `BooruServerManager/0.1.0 (by your_name on e621)`. |
+| e621 | Account → *Manage API Access* (key). Put your e621 username in the username field: e621 policy requires a descriptive User-Agent that identifies you, e.g. `BooruServerManager/0.2.0 (by your_name on e621)`. |
 | Danbooru | Profile → *API Key*. Danbooru asks for a unique descriptive User-Agent too; the extension generates one containing your account id when credentials are present. |
 | Gelbooru | Account → *Options → API Access Credentials*: copy **API key** and **user id** (both are required together). |
 | rule34.xxx and other Gelbooru forks | *My Account → Options → API Access Credentials*; rule34.xxx **requires** both fields even for reading. |
@@ -304,21 +305,25 @@ smoke test in one go.
 | Hydrus | In the client: *services → manage services → client api → add* a key with *search for and fetch files*; base URL is shown under *services → review services*. |
 | Pawchive | Nothing — no login. |
 
-Credentials are stored only in `chrome.storage.local` on your machine, are never
-rendered in full (masked previews only), and are never written to console output or
-diagnostics — see [docs/SECURITY.md](docs/SECURITY.md).
+Server credentials are stored unencrypted by the extension in `chrome.storage.local`
+and masked in profile views. New **Hydrus** URLs omit its key, but Chrome Downloads'
+handling of the required authentication header on redirects and in browser storage
+is unverified. Use a restricted key and trusted non-redirecting endpoint. Rotate
+keys exposed by older versions and manually remove old browser records; migration
+cannot clean external history or exports. Share links can also contain private keys.
+See [docs/SECURITY.md](docs/SECURITY.md) before using credentials or sharing links.
 
 ## What the UI looks like
 
 | Surface | Route / entry | Purpose |
 | --- | --- | --- |
-| **Side panel** | toolbar icon (or options → *Open side panel*) | Browse · Queue · Servers · Settings — the primary surface, with a fixed download dock |
+| **Side panel** | toolbar icon (or options → *Open side panel*) | Browse · Queue · Links · Servers · Settings — the primary surface, with a fixed download dock |
 | Server list | `options.html#servers` | Add/edit/duplicate/delete, set default, validate, clear credentials, export/import |
 | Server editor | `options.html#editor` | One form for every site type; fields come from the adapter's `credentialFields()` |
 | Browse | `options.html#browse` | Tag search, rating-filter toggle, post grid, single or bulk download |
 | Queue | `options.html#queue` | Running/pending/failed items, retry, cancel, clear, pause/resume |
 | Settings | `options.html#settings` | Templates, concurrency, request interval, rating enforcement, User-Agent behaviour, theme |
-| Diagnostics | `options.html#diagnostics` | Adapter catalog, environment, per-server validation traces (credential-free), copy-to-clipboard report |
+| Diagnostics | `options.html#diagnostics` | Adapter catalog, environment, redacted validation traces and copy-to-clipboard report; inspect before sharing |
 | Popup | toolbar icon | Current tab detection, quick search, one-click download, queue footer |
 | Content script | any supported post page | Floating download button linked to the matching server |
 
@@ -408,7 +413,7 @@ userscripts/   the standalone Pawchive Link Collector userscript + its README
 | [docs/SIDEPANEL.md](docs/SIDEPANEL.md) | The side panel: layout, tabs, row/queue model, complete settings reference, history notebooks, preview harness |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Layers, data flow, storage schema, message protocol, queue lifecycle |
 | [docs/ADAPTER_CONTRACT.md](docs/ADAPTER_CONTRACT.md) | The full adapter contract + how to add a new booru in ~200 lines |
-| [docs/SECURITY.md](docs/SECURITY.md) | Credential storage, redaction rules, what never leaves the browser |
+| [docs/SECURITY.md](docs/SECURITY.md) | Credential storage, network exposure, redaction limits and outstanding browser checks |
 | [docs/MANUAL_TESTS.md](docs/MANUAL_TESTS.md) | Step-by-step manual test plan with expected results |
 | [docs/TASKS.md](docs/TASKS.md) | Download tasks explained: the "send it to a friend" model, every design option that was considered, and what is parked |
 | [docs/WORKLIST.md](docs/WORKLIST.md) | Implemented scope, known gaps and next steps |
@@ -428,6 +433,7 @@ archive/PDF picture packing).
 ## Licence / site terms
 
 Personal, non-commercial use. Respect each site's Terms of Service and API rules:
-the extension keeps to the documented request rates (1 request/second per server
-by default), identifies itself with a descriptive User-Agent, and never
-circumvents authentication or paywalls.
+the extension applies per-profile API spacing (1 request/second by default) and
+Pawchive-specific pacing while its worker is running, and can identify itself
+with a descriptive User-Agent. These are not global limits across browser restarts,
+other profiles or other applications. It does not bypass authentication or paywalls.

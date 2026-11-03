@@ -10,6 +10,7 @@
  */
 import type { BooruPost, RouteMatch, ServerConfigView } from '../shared/types.js';
 import { relativeTime } from '../shared/util.js';
+import { postImage } from './post-image.js';
 import { button, h } from './dom.js';
 import { kindLabel, ratingChip, siteTypeChip } from './format.js';
 
@@ -182,9 +183,8 @@ export function renderPostCard(container: HTMLElement, state: PostCardState, cal
 
   const row = h('div', { class: 'psPostRow' });
   row.appendChild(
-    h('img', {
+    postImage(post, {
       class: 'psPostThumb',
-      src: post.previewUrl || undefined,
       alt: `Preview of post ${post.id}`,
       loading: 'lazy',
       on: { error: (event) => (event.target as HTMLImageElement).classList.add('psBroken') },

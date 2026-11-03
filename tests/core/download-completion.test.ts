@@ -144,6 +144,109 @@ describe('Chrome download completion tracking', () => {
     expect((await harness.history.list())[0]).toMatchObject({ completion: 'browser-complete', bytes: 9 });
   });
 
+  it('keeps an accepted Chrome transfer active when persisting its ID fails once', async () => {
+    const harness = await ready();
+    const server = (await harness.servers.getDefault())!;
+    await harness.queue.enqueuePosts(server.id, [{ id: String(MOCK_POSTS[0]!.id) }]);
+    const originalSet = harness.area.set.bind(harness.area);
+    let rejected = false;
+    vi.spyOn(harness.area, 'set').mockImplementation(async (key, value) => {
+      const queue = value as { items?: QueueItem[] };
+      if (!rejected && key === STORAGE_KEYS.queue && queue.items?.some((item) => typeof item.downloadId === 'number')) {
+        rejected = true;
+        throw new Error('temporary storage failure');
+      }
+      await originalSet(key, value);
+    });
+    await harness.queue.run();
+    expect(rejected).toBe(true);
+    expect(harness.downloader.log).toHaveLength(1);
+    expect(harness.queue.list()[0]).toMatchObject({ status: 'running', downloadId: 1 });
+    expect(await harness.queue.retryFailed()).toBe(0);
+    await harness.queue.refresh();
+    const stored = await harness.area.get<{ items: QueueItem[] }>(STORAGE_KEYS.queue);
+    expect(stored?.items[0]).toMatchObject({ status: 'running', downloadId: 1 });
+    harness.downloader.setState(1, { state: 'complete', bytesReceived: 12 });
+    await harness.queue.handleDownloadChanged(1);
+    expect(harness.queue.summary()).toMatchObject({ done: 1, failed: 0 });
+    expect(harness.downloader.log).toHaveLength(1);
+  });
+
+  it('records a pre-start storage error without starting a browser download', async () => {
+    const harness = await ready();
+    const server = (await harness.servers.getDefault())!;
+    await harness.queue.enqueuePosts(server.id, [{ id: String(MOCK_POSTS[0]!.id) }]);
+    const originalSet = harness.area.set.bind(harness.area);
+    let rejected = false;
+    vi.spyOn(harness.area, 'set').mockImplementation(async (key, value) => {
+      const queue = value as { items?: QueueItem[] };
+      if (!rejected && key === STORAGE_KEYS.queue && queue.items?.some((item) => item.status === 'running' && !item.downloadId)) {
+        rejected = true;
+        throw new Error('temporary storage failure');
+      }
+      await originalSet(key, value);
+    });
+    await harness.queue.run();
+    expect(rejected).toBe(true);
+    expect(harness.queue.list()[0]).toMatchObject({ status: 'failed', downloadId: null });
+    expect(harness.downloader.log).toHaveLength(0);
+    expect(await harness.queue.retryFailed()).toBe(1);
+  });
+
+  it('does not clear a completed row until its failed history write is repaired', async () => {
+    const harness = await ready();
+    const { server, item } = await queuePost(harness);
+    const add = vi.spyOn(harness.history, 'add').mockRejectedValue(new Error('storage unavailable'));
+    harness.downloader.setState(item.downloadId!, { state: 'complete' });
+    await harness.queue.handleDownloadChanged(item.downloadId!);
+    expect(harness.queue.list()[0]).toMatchObject({ status: 'done', bookkeepingPending: true });
+    expect(await harness.queue.clear('completed')).toBe(0);
+    expect(harness.queue.list()).toHaveLength(1);
+    expect(await harness.queue.enqueuePosts(server.id, [{ id: item.postId }])).toMatchObject({ added: 0, skipped: 1 });
+    const direct = await harness.router({ type: 'posts/download', payload: { serverId: server.id, postId: item.postId } });
+    expect(direct.ok).toBe(false);
+    expect(harness.downloader.log).toHaveLength(1);
+    add.mockRestore();
+    await harness.queue.refresh();
+    expect(await harness.history.has(server.id, item.postId)).toBe(true);
+    expect(await harness.queue.clear('completed')).toBe(1);
+  });
+
+  it('repairs a canceled pending mirror row when its link update fails', async () => {
+    const harness = await ready();
+    const url = 'https://catbox.moe/cancel-pending.zip';
+    const link = collectMirrorLinks({ content: url }, { serverId: null, siteType: null, postId: null, postTitle: null, postUrl: null, creator: null }, { filter: 'any' })[0]!;
+    await harness.links.add([link]);
+    await ok(harness, { type: 'links/queue', payload: { ids: [link.id] } });
+    const mark = vi.spyOn(harness.links, 'mark').mockRejectedValueOnce(new Error('storage unavailable'));
+    await harness.queue.cancel(harness.queue.list()[0]!.id);
+    expect(harness.queue.list()[0]).toMatchObject({ status: 'canceled', bookkeepingPending: true });
+    await harness.queue.refresh();
+    expect((await harness.links.byId(link.id))?.status).toBe('new');
+    expect(harness.queue.list()[0]?.bookkeepingPending).toBe(false);
+    mark.mockRestore();
+  });
+
+  it('defers retrying a failed mirror until its link outcome is durable', async () => {
+    const harness = await ready();
+    const url = 'https://catbox.moe/retry-pending.zip';
+    const link = collectMirrorLinks({ content: url }, { serverId: null, siteType: null, postId: null, postTitle: null, postUrl: null, creator: null }, { filter: 'any' })[0]!;
+    await harness.links.add([link]);
+    await ok(harness, { type: 'links/queue', payload: { ids: [link.id] } });
+    await harness.queue.run();
+    const item = harness.queue.list()[0]!;
+    const mark = vi.spyOn(harness.links, 'mark').mockRejectedValue(new Error('storage unavailable'));
+    harness.downloader.setState(item.downloadId!, { state: 'interrupted', error: 'NETWORK_FAILED' });
+    await harness.queue.handleDownloadChanged(item.downloadId!);
+    expect(harness.queue.list()[0]).toMatchObject({ status: 'failed', bookkeepingPending: true });
+    expect(await harness.queue.retryFailed()).toBe(0);
+    expect(harness.queue.list()[0]?.status).toBe('failed');
+    mark.mockRestore();
+    expect(await harness.queue.retryFailed()).toBe(1);
+    expect(harness.queue.list()[0]).toMatchObject({ status: 'pending', bookkeepingPending: false });
+    expect((await harness.links.byId(link.id))?.status).toBe('queued');
+  });
+
   it('reconciles a completed browser transfer after a worker restart without starting it again', async () => {
     const harness = await ready();
     const { server, item } = await queuePost(harness);
@@ -445,6 +548,22 @@ describe('Chrome downloader API integration', () => {
       });
       expect((data[STORAGE_KEYS.history] as DownloadHistoryEntry[])[0]).toMatchObject({ completion: 'browser-complete', bytes: 88 });
     } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('reports an unavailable MV3 blob fallback without fetching the entire file', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(URL, 'createObjectURL');
+    const fetchImpl = vi.fn(async () => new Response('file'));
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: undefined });
+    vi.stubGlobal('chrome', { downloads: { download: vi.fn().mockRejectedValue(new Error('permission denied')) } });
+    try {
+      const downloader = new ChromeDownloader({ fetchImpl });
+      const error = await downloader.download({ url: 'https://example.test/file.jpg', filename: 'file.jpg' }).catch((caught: Error) => caught);
+      expect(String(error)).toMatch(/blob.*(unavailable|not available|unsupported)/i);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      if (descriptor) Object.defineProperty(URL, 'createObjectURL', descriptor);
       vi.unstubAllGlobals();
     }
   });

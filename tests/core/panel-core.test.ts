@@ -12,7 +12,7 @@ import { DownloadHistoryStore, SearchHistoryStore, historyKey } from '../../src/
 import { batchRange, fromToRange, parsePageRange } from '../../src/core/pages.js';
 import { composeSearchTags, countFilters } from '../../src/core/search.js';
 import { DEFAULT_SETTINGS, type DownloadHistoryEntry } from '../../src/shared/types.js';
-import { normalizeSettings } from '../../src/core/settings.js';
+import { normalizeSettings, SettingsStore } from '../../src/core/settings.js';
 import { TEMPLATE_TOKENS, buildTemplate, isCanonicalTemplate, isTokenOnlyTemplate, previewNaming, templateTokensInUse } from '../../src/core/template.js';
 import { postMatchesMedia } from '../../src/ui/panel-listing.js';
 
@@ -214,6 +214,13 @@ describe('download history', () => {
 });
 
 describe('search history', () => {
+  it('does not lose simultaneous searches', async () => {
+    const area = new MemoryStorageArea();
+    const store = new SearchHistoryStore(area);
+    await Promise.all(['cat', 'dog', 'bird'].map((query) => store.add('server-1', query, 5)));
+    expect((await new SearchHistoryStore(area).list('server-1')).map((entry) => entry.query).sort()).toEqual(['bird', 'cat', 'dog']);
+  });
+
   it('keeps the newest query first and de-duplicates case-insensitively', async () => {
     const store = new SearchHistoryStore(new MemoryStorageArea());
     await store.add('server-1', 'cat', 5);
@@ -221,6 +228,12 @@ describe('search history', () => {
     await store.add('server-1', 'CAT', 5);
     const entries = await store.list('server-1');
     expect(entries.map((entry) => entry.query)).toEqual(['CAT', 'dog']);
+  });
+
+  it('does not remember a query when the limit is zero', async () => {
+    const store = new SearchHistoryStore(new MemoryStorageArea());
+    await store.add('server-1', 'cat', 0);
+    expect(await store.list()).toEqual([]);
   });
 
   it('keeps a per-server limit', async () => {
@@ -250,6 +263,14 @@ describe('search history', () => {
 });
 
 describe('panel settings keys', () => {
+  it('preserves simultaneous updates to different settings', async () => {
+    const area = new MemoryStorageArea();
+    const store = new SettingsStore(area);
+    await Promise.all([store.save({ theme: 'light' }), store.save({ maxConcurrency: 5 })]);
+    const saved = await new SettingsStore(area).get();
+    expect(saved.theme).toBe('light');
+    expect(saved.maxConcurrency).toBe(5);
+  });
   it('fills in the panel defaults', () => {
     const settings = normalizeSettings({});
     expect(settings.uiMode).toBe('sidepanel');

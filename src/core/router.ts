@@ -12,7 +12,7 @@ import type {
   TaskRun,
   TaskView,
 } from '../shared/types.js';
-import { deepClone, splitTags, uniqueBy } from '../shared/util.js';
+import { deepClone, redactUrl, splitTags, uniqueBy } from '../shared/util.js';
 import type { BooruClient } from './client.js';
 import { requireOriginalFile, type Downloader } from './downloads.js';
 import type { DiagnosticsInfo, RouterResponse, UiRequest } from './messages.js';
@@ -20,7 +20,7 @@ import { buildDownloadPath, sanitizePathSegment } from './naming.js';
 import type { DownloadQueue } from './queue.js';
 import { createAdapterContext, detectAdapterForUrl, getAdapter } from './registry.js';
 import type { ServerStore } from './servers.js';
-import { toServerView } from './servers.js';
+import { sameServerConnection, toServerView } from './servers.js';
 import { DownloadHistoryStore, SearchHistoryStore } from './history.js';
 import {
   classifyMirrorLink,
@@ -91,11 +91,11 @@ function fileNameHint(filename: string | null | undefined): string {
 
 /**
  * One request handler for every surface (service worker, popup, options page and
- * the browser preview). The UI only ever sends `UiRequest`s - it never touches
- * an adapter, a credential or a network call itself.
+ * the browser preview). API actions use `UiRequest`s, although UI images can
+ * load remote thumbnails directly.
  *
- * Server credentials are masked in responses. Collected mirror URLs intentionally
- * retain fragments and may themselves contain bearer or decryption keys.
+ * Server profile credentials are masked. Generated Hydrus URLs omit its key;
+ * mirror URLs retain fragments and may contain private keys.
  */
 export function createRouter(deps: RouterDeps): UiMessageHandler {
   const historyStore = deps.history ?? (deps.storage ? new DownloadHistoryStore(deps.storage) : null);
@@ -457,6 +457,9 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
 
       case 'posts/get':
         return deps.client.getPost(request.payload.serverId, request.payload.postId);
+
+      case 'posts/thumbnail':
+        return { dataUrl: await deps.client.getHydrusThumbnail(request.payload.serverId, request.payload.postId) };
 
       case 'posts/resolveUrl': {
         const { post, server, route: resolved } = await deps.client.resolvePostFromUrl(request.payload.url);
@@ -1124,15 +1127,24 @@ export function createRouter(deps: RouterDeps): UiMessageHandler {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    // A blank secret on an existing profile means "keep the stored one" - the UI
-    // never receives the stored key, so validation must fill it back in.
+    // Masked-edit validation may reuse credentials only for the same target;
+    // otherwise it could send an old API key to a newly configured server.
     if (input.id) {
       const existing = await deps.servers.get(input.id);
       if (existing) {
-        if (!draft.apiKey) draft.apiKey = existing.apiKey;
-        if (!draft.username) draft.username = existing.username;
-        if (!draft.userId) draft.userId = existing.userId;
-        if (!draft.customUserAgent) draft.customUserAgent = existing.customUserAgent;
+        const sameTarget = sameServerConnection(existing, draft);
+        if (!sameTarget && existing.apiKey && !draft.apiKey) {
+          throw new BooruError('Changing the server URL or site type requires an explicit credential choice.', {
+            kind: 'incomplete-config',
+            hint: 'Re-enter the key for the new server, or clear the old profile credentials before changing it.',
+          });
+        }
+        if (sameTarget) {
+          if (!draft.apiKey) draft.apiKey = existing.apiKey;
+          if (!draft.username) draft.username = existing.username;
+          if (!draft.userId) draft.userId = existing.userId;
+          if (!draft.customUserAgent) draft.customUserAgent = existing.customUserAgent;
+        }
       }
     }
     return draft;
@@ -1185,7 +1197,7 @@ export async function buildDiagnostics(deps: RouterDeps, includeUserAgentSync = 
       id: server.id,
       label: server.label,
       siteType: server.siteType,
-      baseUrl: server.baseUrl,
+      baseUrl: redactUrl(server.baseUrl),
       ratingFilterEnabled: server.ratingFilterEnabled,
       hasApiKey: !!server.apiKey,
       validationStatus: server.validationStatus,

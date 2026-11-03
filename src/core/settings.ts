@@ -95,9 +95,16 @@ function sanitizeTemplate(value: unknown, fallback: string): string {
 
 export class SettingsStore {
   private cache: ExtensionSettings | null = null;
+  private chain: Promise<unknown> = Promise.resolve();
   private readonly listeners = new Set<SettingsListener>();
 
   constructor(private readonly area: StorageArea) {}
+
+  private serialize<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.chain.then(task, task);
+    this.chain = next.then(() => undefined, () => undefined);
+    return next;
+  }
 
   async get(): Promise<ExtensionSettings> {
     if (this.cache) return { ...this.cache };
@@ -107,12 +114,14 @@ export class SettingsStore {
   }
 
   async save(patch: Partial<ExtensionSettings>): Promise<ExtensionSettings> {
-    const current = await this.get();
-    const next = normalizeSettings({ ...current, ...patch });
-    this.cache = next;
-    await this.area.set(STORAGE_KEYS.settings, next);
-    this.listeners.forEach((listener) => listener({ ...next }));
-    return { ...next };
+    return this.serialize(async () => {
+      const current = await this.get();
+      const next = normalizeSettings({ ...current, ...patch });
+      await this.area.set(STORAGE_KEYS.settings, next);
+      this.cache = next;
+      this.listeners.forEach((listener) => listener({ ...next }));
+      return { ...next };
+    });
   }
 
   async reset(): Promise<ExtensionSettings> {

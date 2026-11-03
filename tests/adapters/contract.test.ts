@@ -36,7 +36,7 @@ describe('adapter contract conformance', () => {
     expect(adapter.hostPatterns.length).toBeGreaterThan(0);
     expect(capabilities.maxPostsPerRequest).toBeGreaterThan(0);
     expect(capabilities.minRequestIntervalMs).toBeGreaterThanOrEqual(0);
-    expect(['basic', 'query', 'basic-or-query', 'query-with-userid']).toContain(capabilities.authStyle);
+    expect(['basic', 'query', 'basic-or-query', 'query-with-userid', 'header']).toContain(capabilities.authStyle);
     expect(capabilities.apiDocsUrl).toMatch(/^https?:\/\//);
     expect(Array.isArray(capabilities.notes)).toBe(true);
     expect(adapter.defaults.baseUrl).toMatch(/^https?:\/\//);

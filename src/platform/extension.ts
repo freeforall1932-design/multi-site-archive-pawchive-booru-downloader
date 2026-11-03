@@ -1,4 +1,5 @@
 import { ChromeDownloader } from '../core/downloads.js';
+import { redactUrlsInText } from '../shared/util.js';
 import type { RouterResponse, UiRequest } from '../core/messages.js';
 import { ChromeStorageArea } from '../core/storage.js';
 import { syncUserAgentRules } from '../core/userAgent.js';
@@ -8,7 +9,29 @@ function runtimeAvailable(): boolean {
   return typeof globalThis.chrome !== 'undefined' && !!globalThis.chrome?.runtime?.id;
 }
 
-/** Chrome MV3 implementation. All cross-origin traffic happens in the worker. */
+// A lost response does not prove the worker failed to execute a request. Only
+// repeat read-like operations; replaying a start, import or mutation can create
+// duplicate downloads or other side effects.
+const RETRYABLE_READS = new Set<UiRequest['type']>([
+  'servers/list', 'servers/export', 'browse/search', 'posts/get', 'posts/thumbnail', 'posts/resolveUrl', 'routes/detect',
+  'links/list', 'links/posts', 'links/export', 'tasks/list', 'tasks/export', 'queue/list', 'history/list',
+  'searches/list', 'settings/get',
+]);
+
+function uncertainResponse(request: UiRequest): RouterResponse {
+  return {
+    ok: false,
+    error: {
+      message: 'The background worker did not confirm the request; it may already have finished.',
+      kind: 'unknown',
+      hint: RETRYABLE_READS.has(request.type)
+        ? 'Refresh and try again.'
+        : 'Check the current state and, for downloads, the queue and Chrome Downloads before retrying.',
+    },
+  };
+}
+
+/** Chrome MV3 implementation. API actions use the worker; UI images can load remotely. */
 export class ExtensionPlatform implements Platform {
   readonly environment = 'extension' as const;
   readonly storage = new ChromeStorageArea();
@@ -38,22 +61,21 @@ export class ExtensionPlatform implements Platform {
     }
     try {
       const response = (await globalThis.chrome.runtime.sendMessage(request)) as RouterResponse | undefined;
-      if (!response) {
-        return { ok: false, error: { message: 'The background worker returned no response', kind: 'unknown', hint: null } };
-      }
-      return response;
+      return response ?? uncertainResponse(request);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      // A sleeping MV3 worker rejects the first message; one retry wakes it.
+      const message = redactUrlsInText(error instanceof Error ? error.message : String(error));
       if (/Receiving end does not exist|message port closed/i.test(message)) {
-        globalThis.chrome.runtime.sendMessage?.({ type: 'settings/get' }).catch(() => undefined);
-        try {
-          const retry = (await globalThis.chrome.runtime.sendMessage(request)) as RouterResponse | undefined;
-          if (retry) return retry;
-        } catch {
-          /* fall through to the error below */
+        if (RETRYABLE_READS.has(request.type)) {
+          try {
+            const retry = (await globalThis.chrome.runtime.sendMessage(request)) as RouterResponse | undefined;
+            if (retry) return retry;
+          } catch {
+            /* The read still failed; report the uncertain result below. */
+          }
         }
+        return uncertainResponse(request);
       }
+      if (!RETRYABLE_READS.has(request.type)) return uncertainResponse(request);
       return { ok: false, error: { message: `Background worker error: ${message}`, kind: 'unknown', hint: null } };
     }
   }
@@ -74,16 +96,20 @@ export class ExtensionPlatform implements Platform {
 
   openOptions(hash?: string): void {
     const suffix = hash ? `#${hash.replace(/^#/, '')}` : '';
-    if (globalThis.chrome?.runtime?.openOptionsPage) {
-      void globalThis.chrome.runtime.openOptionsPage();
-      if (suffix) {
-        // Best effort: also switch the tab that is already open.
-        void globalThis.chrome.tabs?.query({ url: globalThis.chrome.runtime.getURL('options/options.html') }, (tabs) => {
-          tabs.forEach((tab) => {
-            if (tab.id !== undefined) void globalThis.chrome.tabs.update(tab.id, { active: true, url: `${tab.url}${suffix}` });
-          });
-        });
-      }
+    const runtime = globalThis.chrome?.runtime;
+    const tabs = globalThis.chrome?.tabs;
+    if (suffix && runtime?.getURL && tabs?.create) {
+      // Create the requested deep link directly: openOptionsPage followed by a
+      // tab query races creation and can append a second hash to an existing URL.
+      const url = `${runtime.getURL('options/options.html')}${suffix}`;
+      void (async () => {
+        try { await tabs.create({ url }); }
+        catch { await runtime.openOptionsPage?.().catch(() => undefined); }
+      })();
+      return;
+    }
+    if (runtime?.openOptionsPage) {
+      void runtime.openOptionsPage().catch(() => undefined);
       return;
     }
     if (suffix) globalThis.location.hash = suffix;

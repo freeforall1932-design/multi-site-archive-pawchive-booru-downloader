@@ -37,6 +37,7 @@ export type UiRequest =
   | { type: 'servers/import'; payload: { json: string; includeSecrets?: boolean } }
   | { type: 'browse/search'; payload: { serverId: string | null; spec: SearchSpec } }
   | { type: 'posts/get'; payload: { serverId: string | null; postId: string } }
+  | { type: 'posts/thumbnail'; payload: { serverId: string; postId: string } }
   | { type: 'posts/resolveUrl'; payload: { url: string } }
   | { type: 'posts/download'; payload: { serverId?: string | null; postId?: string; url?: string } }
   | { type: 'routes/detect'; payload: { url: string } }
@@ -103,6 +104,7 @@ export interface ResponseMap {
   'servers/import': { imported: number; skipped: number; errors: string[] };
   'browse/search': SearchResult;
   'posts/get': BooruPost;
+  'posts/thumbnail': { dataUrl: string };
   'posts/resolveUrl': { post: BooruPost; server: ServerConfigView; route: RouteMatch };
   'posts/download': { filename: string; post: BooruPost; viaFallback: boolean; downloadId: number | null };
   'routes/detect': (RouteMatch & { server: ServerConfigView | null }) | null;
