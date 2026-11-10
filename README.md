@@ -257,6 +257,10 @@ Pawchive.
 `reference/`): IBSearch (site is gone), Shimmie 2 and ZeroChan (HTML scraping
 only — breaks on every theme change), RSS (not a booru).
 
+**Furry34 is not supported:** its separate API and rendition formats have been
+investigated, but original-file semantics and live extension downloads remain
+unverified. See [docs/FURRY34_INVESTIGATION.md](docs/FURRY34_INVESTIGATION.md).
+
 Additional booru-like sites can be added through the adapter contract — see
 [docs/ADAPTER_CONTRACT.md](docs/ADAPTER_CONTRACT.md).
 

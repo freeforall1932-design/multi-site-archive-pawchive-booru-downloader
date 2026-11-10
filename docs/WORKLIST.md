@@ -129,6 +129,7 @@ extension, Hydrus or Pawchive run.
 
 | Gap | Notes / plan |
 | --- | --- |
+| **Furry34 is not supported** | Its separate post API is reachable, but image/video original-file semantics, cursor search and installed-extension downloads remain unverified. Do not substitute known renditions for originals; its terms also restrict access and downloads. See [FURRY34_INVESTIGATION.md](FURRY34_INVESTIGATION.md). |
 | **Hydrus download-header and redirect risk** | New URLs are key-free; metadata/thumbnails reject redirects and original downloads pass a transient header after exact-target validation. Chrome Downloads redirect handling and header storage, and a live Hydrus client, remain untested. Use a trusted direct endpoint and restricted key; rotate previously exposed keys and clean old browser records. See [SECURITY.md](SECURITY.md). |
 | **User-Agent rule scope is broad** | DNR `requestDomains` includes subdomains and has no initiator restriction. Test a safe extension-only restriction in Chrome before changing it. |
 | **No live Chrome/Pawchive validation yet** | Exercise MV3 start/completion, interruption, cancellation, worker restart, permissions, originals, all-file selection and Mega export against permitted test data. See [MANUAL_TESTS.md](MANUAL_TESTS.md). |
