@@ -40,6 +40,16 @@ describe('validation - preflight (no network)', () => {
     expect(result.endpointOk).toBeNull();
   });
 
+  it('rejects embedded URL credentials before making a request', async () => {
+    let called = false;
+    const validator = service(async () => { called = true; return jsonResponse([]); });
+    const result = await validator.validate(e621Server({ baseUrl: 'https://user:secret-pass@e621.net' }), DEFAULT_SETTINGS);
+    expect(result.kind).toBe('incomplete-config');
+    expect(result.message).toMatch(/credential/i);
+    expect(JSON.stringify(result)).not.toContain('secret-pass');
+    expect(called).toBe(false);
+  });
+
   it('requires the missing credential fields for Gelbooru (user id without key)', async () => {
     const validator = service(failing);
     const result = await validator.validate(gelbooruServer({ apiKey: '', userId: '4242' }), DEFAULT_SETTINGS);

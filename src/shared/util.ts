@@ -136,28 +136,63 @@ export function redactUrl(raw: string): string {
   try {
     const url = new URL(raw);
     let touched = false;
-    for (const key of SECRET_KEYS) {
-      if (url.searchParams.has(key)) {
+    const secretNames = new Set(SECRET_KEYS.map((key) => key.toLowerCase()));
+    for (const key of [...url.searchParams.keys()]) {
+      if (secretNames.has(key.toLowerCase())) {
         url.searchParams.set(key, '***');
         touched = true;
       }
+    }
+    // Pawchive temporary downloads use `s` as a bearer signature. Do not
+    // redact generic `s` parameters globally: booru DAPI uses `s=post`.
+    if (/(?:^|\.)pawchive\.(?:pw|st)$/i.test(url.hostname) && url.searchParams.has('s')) {
+      url.searchParams.set('s', '***');
+      touched = true;
     }
     if (url.username || url.password) {
       url.username = '';
       url.password = '';
       touched = true;
     }
+    // Share-link fragments can be bearer/decryption keys. Exported links keep
+    // them, but diagnostics and logs must never expose them.
+    if (url.hash) {
+      url.hash = '#***';
+      touched = true;
+    }
     return touched ? url.toString() : raw;
   } catch {
-    return raw.replace(/([?&](?:api_key|apikey|login|password_hash|token)=)[^&]*/gi, '$1***');
+    return raw.replace(/([?&](?:api_key|apikey|login|password_hash|token)=)[^&#]*/gi, '$1***').replace(/#.*/, '#***');
   }
+}
+
+/** Remove old Hydrus bearer parameters while retaining other URL data and fragments. */
+export function stripHydrusCredentials(raw: string): string {
+  try {
+    const url = new URL(raw);
+    let changed = false;
+    for (const name of [...url.searchParams.keys()]) {
+      if (/^hydrus-client-api-(?:access|session)-key$/i.test(name)) {
+        url.searchParams.delete(name);
+        changed = true;
+      }
+    }
+    return changed ? url.toString() : raw;
+  } catch {
+    return raw;
+  }
+}
+
+/** Redact URL secrets when a browser/network error embeds a URL in free text. */
+export function redactUrlsInText(text: string): string {
+  return text.replace(/https?:\/\/[^\s<>"'`]+/gi, (url) => redactUrl(url));
 }
 
 /** Redact any credential-looking header values. */
 export function redactHeaders(headers: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(headers)) {
-    out[key] = /^(authorization|cookie|x-api-key|api-key)$/i.test(key) ? '***' : value;
+    out[key] = /^(authorization|cookie|x-api-key|api-key|hydrus-client-api-access-key|hydrus-client-api-session-key)$/i.test(key) ? '***' : value;
   }
   return out;
 }

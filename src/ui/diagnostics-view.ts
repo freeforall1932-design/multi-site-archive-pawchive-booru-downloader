@@ -133,7 +133,7 @@ export function renderDiagnostics(container: HTMLElement, info: DiagnosticsInfo,
 }
 
 export function copyDiagnostics(info: DiagnosticsInfo): void {
-  // Never include credentials: server entries carry a boolean, not the key.
+  // Server key fields are masked, but arbitrary site data may contain secrets.
   const payload = JSON.stringify({ ...info, generatedAt: new Date().toISOString() }, null, 2);
   void navigator.clipboard?.writeText(payload).then(
     () => toast('Diagnostics copied to clipboard', 'success'),

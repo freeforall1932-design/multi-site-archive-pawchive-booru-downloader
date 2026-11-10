@@ -15,10 +15,12 @@
  * façade is backed by the offline mock booru, so the identical code path is
  * exercised without any network traffic.
  */
+import { registerBuiltinAdapters } from '../adapters/index.js';
 import type { AdapterCatalogEntry, DiagnosticsInfo, UiRequest } from '../core/messages.js';
 import { fromToRange, parsePageRange } from '../core/pages.js';
 import { composeSearchTags } from '../core/search.js';
 import { getAdapter } from '../core/registry.js';
+import { isUsableServer } from '../core/servers.js';
 import { getPlatform, isExtensionEnvironment } from '../platform/index.js';
 import type {
   BooruPost,
@@ -36,7 +38,9 @@ import type {
   TaskView,
   ValidationResult,
 } from '../shared/types.js';
-import { h } from '../ui/dom.js';
+import { safeUrl } from '../shared/util.js';
+import { h, preserveInputFocus } from '../ui/dom.js';
+import { OrderedUpdates } from '../ui/ordered-updates.js';
 import { renderDiagnostics, copyDiagnostics } from '../ui/diagnostics-view.js';
 import {
   pickFile,
@@ -49,7 +53,7 @@ import {
 import { postMatchesMedia, renderListingCard, type ListingState } from '../ui/panel-listing.js';
 import { renderPostCard, renderTabContext, type PostCardState, type TabContext } from '../ui/panel-context.js';
 import { renderDock, renderQueueList, type DockState, type QueueListState, type QueueRowView } from '../ui/panel-queue.js';
-import { draftForSiteType, draftFromServer, renderServerForm, type ServerFormDraft } from '../ui/server-form.js';
+import { draftForSiteType, draftFromServer, draftSaveDecision, draftValidationSignature, withSiteDefaults, renderServerForm, type ServerFormDraft } from '../ui/server-form.js';
 import { renderServerList } from '../ui/server-list.js';
 import { renderSettingsSections } from '../ui/settings-sections.js';
 import { showError, toast } from '../ui/toast.js';
@@ -87,7 +91,7 @@ const TABS: Array<{ id: PanelTab; label: string }> = [
 ];
 
 /** Profiles whose API answers with the post bodies mirror links live in. */
-const ARCHIVE_SITE_TYPES = new Set(['kemono', 'coomer', 'pawchive']);
+const ARCHIVE_SITE_TYPES = new Set(['pawchive']);
 
 interface ListingRuntime {
   serverId: string | null;
@@ -113,6 +117,7 @@ interface EditorRuntime {
   isNew: boolean;
   apiKeyMask: string;
   validation: ValidationResult | null;
+  validatedSignature: string | null;
   validating: boolean;
   saving: boolean;
 }
@@ -156,6 +161,7 @@ interface PanelState {
   historyCount: number;
   searchCount: number;
   thumbnails: Map<string, string>;
+  serverFilter: string;
   editor: EditorRuntime | null;
   diagnostics: DiagnosticsInfo | null;
   hostAccess: { origin: string; granted: boolean } | null;
@@ -165,7 +171,7 @@ interface PanelState {
 }
 
 function emptySummary(): QueueSummary {
-  return { pending: 0, running: 0, done: 0, failed: 0, skipped: 0, canceled: 0, total: 0, paused: false, active: false };
+  return { pending: 0, running: 0, done: 0, failed: 0, skipped: 0, canceled: 0, unverified: 0, total: 0, paused: false, active: false };
 }
 
 const state: PanelState = {
@@ -184,7 +190,7 @@ const state: PanelState = {
     toPage: '',
     rangeText: '1',
     media: 'all',
-    skipDownloaded: true,
+    skipDownloaded: false,
     ratingOverride: null,
     suggestions: [],
     lastResult: null,
@@ -199,7 +205,7 @@ const state: PanelState = {
     serverId: null,
     query: '',
     links: [],
-    stats: { total: 0, new: 0, queued: 0, done: 0, failed: 0 },
+    stats: { total: 0, new: 0, queued: 0, done: 0, failed: 0, unverified: 0 },
     tasks: [],
     expanded: new Set(),
     activeTaskId: null,
@@ -217,6 +223,7 @@ const state: PanelState = {
   historyCount: 0,
   searchCount: 0,
   thumbnails: new Map(),
+  serverFilter: '',
   editor: null,
   diagnostics: null,
   hostAccess: null,
@@ -239,6 +246,7 @@ async function send<T>(request: UiRequest): Promise<T | null> {
 // ----------------------------------------------------------------------- boot
 
 async function boot(): Promise<void> {
+  registerBuiltinAdapters();
   if (!isExtensionEnvironment()) {
     // The preview harness serves this page in a normal tab, so the mock service
     // graph has to be installed before the first request goes out.
@@ -247,16 +255,15 @@ async function boot(): Promise<void> {
     els.previewBanner.hidden = false;
   }
 
-  await Promise.all([refreshSettings(), refreshServers(), refreshQueue(), refreshHistory(), refreshLinks()]);
+  await Promise.all([refreshSettings(), refreshServers(), refreshQueue(), refreshHistory(), refreshLinks(), refreshDiagnostics()]);
   state.links.serverId =
-    state.servers.find((entry) => ARCHIVE_SITE_TYPES.has(entry.siteType))?.id ?? state.servers[0]?.id ?? null;
+    state.servers.find((entry) => ARCHIVE_SITE_TYPES.has(entry.siteType) && isUsableServer(entry))?.id ?? null;
   state.listing.media = state.settings?.mediaFilter ?? 'all';
-  state.listing.skipDownloaded = state.settings?.skipDownloaded ?? true;
+  state.listing.skipDownloaded = state.settings?.skipDownloaded ?? false;
   state.tab = hashTab() ?? state.settings?.panelDefaultTab ?? 'browse';
   applyTheme(state.settings?.theme ?? 'system');
   render();
   void refreshContext();
-  void refreshDiagnostics();
   startPolling();
 }
 
@@ -276,12 +283,15 @@ async function refreshServers(): Promise<void> {
   const servers = await send<ServerConfigView[]>({ type: 'servers/list' });
   if (!servers) return;
   state.servers = servers;
-  if (!state.listing.serverId || !servers.some((entry) => entry.id === state.listing.serverId)) {
-    state.listing.serverId = servers.find((entry) => entry.isDefault)?.id ?? servers[0]?.id ?? null;
+  const supported = servers.filter(isUsableServer);
+  if (!state.listing.serverId || !supported.some((entry) => entry.id === state.listing.serverId)) {
+    state.listing.serverId = supported.find((entry) => entry.isDefault)?.id ?? supported[0]?.id ?? null;
   }
-  state.hostAccess = servers.length
-    ? { origin: new URL(servers[0]!.baseUrl).origin, granted: await platform.permissions.contains(new URL(servers[0]!.baseUrl).origin) }
-    : null;
+  const origin = supported[0] ? safeUrl(supported[0].baseUrl)?.origin ?? null : null;
+  state.hostAccess = origin ? { origin, granted: await platform.permissions.contains(origin) } : null;
+  if (!state.links.serverId || !servers.some((entry) => entry.id === state.links.serverId && ARCHIVE_SITE_TYPES.has(entry.siteType) && isUsableServer(entry))) {
+    state.links.serverId = servers.find((entry) => ARCHIVE_SITE_TYPES.has(entry.siteType) && isUsableServer(entry))?.id ?? null;
+  }
   await refreshSuggestions();
 }
 
@@ -289,6 +299,8 @@ async function refreshQueue(): Promise<void> {
   const result = await send<{ summary: QueueSummary; items: QueueItem[]; maxConcurrency: number }>({ type: 'queue/list' });
   if (!result) return;
   state.queue = { summary: result.summary, items: result.items, maxConcurrency: result.maxConcurrency, busy: state.queue.busy };
+  const post = state.post.post;
+  if (post) state.post = { ...state.post, queued: queueHasPost(post.serverId, post.id) };
   reconcileSelection();
 }
 
@@ -315,7 +327,13 @@ async function refreshHistory(): Promise<void> {
   const result = await send<{ entries: DownloadHistoryEntry[]; total: number }>({ type: 'history/list' });
   if (!result) return;
   state.historyCount = result.total;
-  state.history = new Map(result.entries.map((entry) => [entry.key, entry]));
+  // Legacy entries may be samples or start-only records. Neither can hide an original.
+  state.history = new Map(result.entries.filter((entry) => entry.quality === 'original' && entry.completion === 'browser-complete').map((entry) => [entry.key, entry]));
+  const post = state.post.post;
+  if (post) {
+    const entry = state.history.get(`${post.serverId}:${post.id}`);
+    state.post = { ...state.post, saved: entry ? { filename: entry.filename, at: entry.at } : null };
+  }
 }
 
 async function refreshSuggestions(): Promise<void> {
@@ -406,7 +424,7 @@ async function loadPost(serverId: string, postId: string): Promise<void> {
   const historyEntry = state.history.get(`${post.serverId}:${post.id}`) ?? null;
   const server = state.servers.find((entry) => entry.id === post.serverId) ?? null;
   const blocked = Boolean(server && state.settings?.enforceRatingFilterOnDownload && !ratingAllowed(server, post.rating));
-  state.thumbnails.set(post.id, post.previewUrl);
+  state.thumbnails.set(`${post.serverId}:${post.id}`, post.previewUrl);
   state.post = {
     loading: false,
     post,
@@ -493,7 +511,7 @@ function pillTone(): string {
   if (state.queue.summary.running || state.queue.summary.active) return 'running';
   if (state.listing.busy === 'crawl') return 'crawling';
   if (state.listing.busy === 'search') return 'crawling';
-  if (state.queue.summary.failed) return 'warn';
+  if (state.queue.summary.failed || state.queue.summary.unverified) return 'warn';
   if (!state.settings) return 'idle';
   return 'idle';
 }
@@ -504,6 +522,7 @@ function statusPillText(): string {
   if (state.listing.busy === 'crawl') return 'fetching';
   if (state.listing.busy === 'search') return 'listing';
   if (state.queue.summary.failed) return `${state.queue.summary.failed} failed`;
+  if (state.queue.summary.unverified) return `${state.queue.summary.unverified} unverified`;
   if (state.queue.summary.pending) return `${state.queue.summary.pending} queued`;
   return 'Ready';
 }
@@ -530,6 +549,7 @@ function renderContext(): void {
     renderPostCard(postHost, state.post, {
       onDownload: () => void downloadPost(),
       onAddToList: () => void addPostToList(),
+      onAddAllPawchiveFiles: state.context.server?.siteType === 'pawchive' ? () => void addAllPawchiveFiles() : undefined,
       onReload: () => {
         const route = state.context.route;
         if (route?.postId && state.context.server) void loadPost(state.context.server.id, route.postId);
@@ -614,7 +634,7 @@ function renderBrowse(): void {
     },
     onOpenServers: () => switchTab('servers'),
   });
-  els.listingHost.replaceChildren(...Array.from(host.children) as HTMLElement[]);
+  preserveInputFocus(els.listingHost, () => els.listingHost.replaceChildren(...Array.from(host.children) as HTMLElement[]));
 
   const listHost = h('div');
   renderQueueList(listHost, buildQueueListState(), listCallbacks());
@@ -638,7 +658,7 @@ function reconcileLinksSelection(): void {
   const next = new Set<string>();
   for (const id of state.links.selection) if (available.has(id)) next.add(id);
   for (const link of state.links.links) {
-    if (link.status === 'done' || link.status === 'failed') continue;
+    if (link.status === 'done' || link.status === 'failed' || link.status === 'unverified') continue;
     if (!state.links.snapshot.has(link.id)) next.add(link.id);
   }
   state.links.selection = next;
@@ -685,10 +705,10 @@ function buildLinksState(): LinksState {
   budget -= unfiled.length;
 
   return {
-    servers: state.servers,
+    servers: state.servers.filter((entry) => ARCHIVE_SITE_TYPES.has(entry.siteType) && isUsableServer(entry)),
     serverId: state.links.serverId,
     query: state.links.query,
-    canCollect: !!server && ARCHIVE_SITE_TYPES.has(server.siteType),
+    canCollect: !!server && ARCHIVE_SITE_TYPES.has(server.siteType) && isUsableServer(server),
     busy: state.links.busy,
     progress: state.links.progress,
     error: state.links.error,
@@ -761,7 +781,7 @@ function renderLinksTab(): void {
     onTaskExport: (taskId) => void exportTask(taskId),
     onTaskRemove: (taskId) => void removeTask(taskId),
   });
-  els.linksHost.replaceChildren(...(Array.from(host.children) as HTMLElement[]));
+  preserveInputFocus(els.linksHost, () => els.linksHost.replaceChildren(...(Array.from(host.children) as HTMLElement[])));
 }
 
 /**
@@ -877,6 +897,8 @@ async function collectLinks(): Promise<void> {
 
 async function queueLinks(ids: string[]): Promise<void> {
   if (!ids.length) return;
+  const unverified = state.links.links.filter((link) => ids.includes(link.id) && link.status === 'unverified').length;
+  if (unverified && !globalThis.confirm(`${unverified} link(s) have unverified prior starts. They may already be on disk. Check Chrome Downloads before retrying. Queue them anyway?`)) return;
   const result = await send<{ queued: number; skipped: number; invalid: number }>({
     type: 'links/queue',
     payload: { ids },
@@ -961,6 +983,9 @@ async function clearLinks(scope: 'all' | 'done' | 'pending'): Promise<void> {
 
 /** Queue everything a task is missing (new files and retries) and start it. */
 async function runTask(taskId: string, mode: 'missing' | 'all'): Promise<void> {
+  const members = new Set(state.links.tasks.find((entry) => entry.task.id === taskId)?.task.memberIds ?? []);
+  const unverified = state.links.links.filter((link) => members.has(link.id) && link.status === 'unverified').length;
+  if (unverified && !globalThis.confirm(`${unverified} task file(s) have unverified prior starts. They may already be on disk. Check Chrome Downloads before retrying. Continue?`)) return;
   state.links.busyTaskId = taskId;
   renderLinksTab();
   const result = await send<{
@@ -977,7 +1002,7 @@ async function runTask(taskId: string, mode: 'missing' | 'all'): Promise<void> {
   await Promise.all([refreshLinks(), refreshQueue()]);
   const parts = [`${result.queued} file(s) queued`];
   if (result.plan.retrying) parts.push(`${result.plan.retrying} retry`);
-  if (result.plan.alreadyDone) parts.push(`${result.plan.alreadyDone} already saved, skipped`);
+  if (result.plan.alreadyDone) parts.push(`${result.plan.alreadyDone} previously completed, skipped`);
   if (result.skipped) parts.push(`${result.skipped} already in the queue`);
   state.dockNotice = {
     text: `${parts.join(' · ')}.${result.started ? ' Downloading slowly in the background.' : ''}`,
@@ -992,7 +1017,7 @@ async function pauseTask(taskId: string): Promise<void> {
   const result = await send<{ task: TaskView | null }>({ type: 'tasks/pause', payload: { taskId } });
   if (!result) return;
   await Promise.all([refreshLinks(), refreshQueue()]);
-  state.dockNotice = { text: 'Task paused. Files already saved stay saved; Download missing resumes the rest.', tone: 'plain' };
+  state.dockNotice = { text: 'Task paused. Waiting starts were removed; already started transfers continue in Chrome.', tone: 'plain' };
   render();
 }
 
@@ -1117,11 +1142,11 @@ function buildListingState(): ListingState {
   const parsed = currentRange();
   const composed = composeSearchTags({
     tags: state.listing.tags,
-    blacklist: state.settings?.tagBlacklist ?? '',
-    globalSuffix: state.settings?.globalTagSuffix ?? '',
+    blacklist: server?.siteType === 'pawchive' ? '' : state.settings?.tagBlacklist ?? '',
+    globalSuffix: server?.siteType === 'pawchive' ? '' : state.settings?.globalTagSuffix ?? '',
   });
   return {
-    servers: state.servers,
+    servers: state.servers.filter(isUsableServer),
     adapters: state.adapters,
     serverId: state.listing.serverId,
     tags: state.listing.tags,
@@ -1166,8 +1191,8 @@ function buildQueueListState(): QueueListState {
   const items = state.queue.items.filter((item) => mediaMatchesItem(item));
   const limit = state.settings?.queueRowLimit ?? 60;
   const rows: QueueRowView[] = items.slice(0, limit).map((item) => {
-    const historyEntry = state.history.get(`${item.serverId}:${item.postId}`) ?? null;
     const isLink = item.kind === 'link';
+    const historyEntry = isLink ? null : state.history.get(`${item.serverId}:${item.postId}`) ?? null;
     const stored = isLink ? state.links.links.find((link) => link.id === item.postId) ?? null : null;
     const url = item.url ?? item.postUrl;
     return {
@@ -1175,7 +1200,7 @@ function buildQueueListState(): QueueListState {
       server: state.servers.find((entry) => entry.id === item.serverId) ?? null,
       selected: state.selection.has(item.id),
       savedFilename: historyEntry?.filename ?? null,
-      thumbnail: state.settings?.showThumbnails === false || isLink ? '' : state.thumbnails.get(item.postId) ?? '',
+      thumbnail: state.settings?.showThumbnails === false || isLink ? '' : state.thumbnails.get(`${item.serverId}:${item.postId}`) ?? '',
       media: isVideoItem(item) ? 'video' : 'image',
       rating: item.rating ?? null,
       linkProvider: stored?.provider ?? null,
@@ -1245,17 +1270,16 @@ function renderDockBar(): void {
   const selected = [...state.selection].filter((id) => state.queue.items.some((item) => item.id === id && item.status === 'pending'));
   const dockState: DockState = {
     concurrency: state.settings?.maxConcurrency ?? 2,
-    filePreference: state.settings?.filePreference ?? 'original',
     selectedCount: selected.length,
     pendingCount: state.queue.summary.pending,
     running: state.queue.summary.running > 0 || state.queue.summary.active,
+    dispatching: state.queue.summary.active,
     paused: state.queue.summary.paused,
     notice: state.dockNotice,
     busy: state.queue.busy,
   };
   renderDock(els.dockHost, dockState, {
     onConcurrencyChange: (value) => void patchSettings({ maxConcurrency: value }),
-    onFilePreferenceChange: (value) => void patchSettings({ filePreference: value }),
     onDownloadSelected: () => void downloadSelected(),
     onStart: () => void startQueue(),
     onPause: () => void pauseQueue(true),
@@ -1315,7 +1339,9 @@ async function runFetch(options: { mode: 'page' | 'range'; download?: boolean })
     done += 1;
     state.listing.progress = { done, total: totalPages, label: `Listed page ${page} · ${collected.length} post(s) so far` };
     renderBrowse();
-    return result.posts.length > 0;
+    // A Pawchive page can have only text/deferred posts but later pages may
+    // still have downloadable files.
+    return result.posts.length > 0 || result.hasMore;
   };
 
   try {
@@ -1345,15 +1371,15 @@ async function runFetch(options: { mode: 'page' | 'range'; download?: boolean })
         type: 'queue/enqueuePosts',
         payload: {
           serverId: server.id,
-          posts: collected.map((post) => ({ id: post.id, label: postLabel(post), postUrl: post.postUrl, rating: post.rating })),
+          posts: collected.map((post) => ({ id: post.id, label: postLabel(post), postUrl: post.postUrl, rating: post.rating, expectedFileHash: post.siteType === 'pawchive' ? post.md5 : null })),
         },
       });
-      for (const post of collected) state.thumbnails.set(post.id, post.previewUrl);
+      for (const post of collected) state.thumbnails.set(`${post.serverId}:${post.id}`, post.previewUrl);
       if (queued) {
         await refreshQueue();
         const bits = [`${queued.added} row(s) added`];
         if (queued.skipped) bits.push(`${queued.skipped} skipped (duplicate or rating filter)`);
-        if (skippedDownloaded) bits.push(`${skippedDownloaded} already downloaded`);
+        if (skippedDownloaded) bits.push(`${skippedDownloaded} previously completed`);
         state.dockNotice = { text: `${bits.join(' · ')}. Review the list, then press Download selected.`, tone: 'ok' };
       }
     } else {
@@ -1417,7 +1443,8 @@ function collectPosts(collected: BooruPost[], result: SearchResult): { added: nu
 }
 
 function postLabel(post: BooruPost): string {
-  return post.tags[0] ? `#${post.id} ${post.tags[0]}` : `${post.siteType} #${post.id}`;
+  const label = post.tags[0] ? `#${post.id} ${post.tags[0]}` : `${post.siteType} #${post.id}`;
+  return post.fileAvailability === 'preview' ? `${label} [preview only]` : label;
 }
 
 // -------------------------------------------------------------- queue actions
@@ -1461,7 +1488,7 @@ async function stopQueue(): Promise<void> {
   for (const item of state.queue.items.filter((entry) => entry.status === 'pending' || entry.status === 'running')) {
     await send({ type: 'queue/cancel', payload: { itemId: item.id } });
   }
-  state.dockNotice = { text: 'Stopped. Canceled rows stay in the list so you can retry them.', tone: 'plain' };
+  state.dockNotice = { text: 'Stop requested. Chrome may take a moment to confirm cancellation; canceled rows remain in the list.', tone: 'plain' };
   await refreshQueue();
   render();
 }
@@ -1474,23 +1501,24 @@ async function cancelItem(itemId: string): Promise<void> {
 
 async function removeItems(itemIds: string[]): Promise<void> {
   if (!itemIds.length) return;
-  await send({ type: 'queue/remove', payload: { itemIds } });
+  const result = await send<{ removed: number }>({ type: 'queue/remove', payload: { itemIds } });
   for (const id of itemIds) state.selection.delete(id);
   await refreshQueue();
-  state.dockNotice = { text: `${itemIds.length} row(s) removed from the list. Files on disk were not touched.`, tone: 'plain' };
+  state.dockNotice = { text: `${result?.removed ?? 0} row(s) removed. Active transfers remain tracked; files on disk were not touched.`, tone: 'plain' };
   render();
 }
 
 async function retryFailed(): Promise<void> {
+  if (state.queue.summary.unverified && !globalThis.confirm(`${state.queue.summary.unverified} row(s) have unverified prior starts. They may already be on disk. Check Chrome Downloads before retrying. Continue?`)) return;
   const result = await send<{ requeued: number; summary: QueueSummary }>({ type: 'queue/retryFailed' });
   await refreshQueue();
   if (result) toast(`${result.requeued} row(s) queued again`, 'success');
-  state.dockNotice = { text: `${result?.requeued ?? 0} failed row(s) are queued again.`, tone: 'plain' };
+  state.dockNotice = { text: `${result?.requeued ?? 0} failed or unverified row(s) are queued again.`, tone: 'plain' };
   render();
 }
 
 async function clearQueue(scope: 'completed' | 'failed' | 'all'): Promise<void> {
-  if (scope === 'all' && state.queue.items.length && !globalThis.confirm('Clear the whole list? Files already downloaded stay on disk.')) return;
+  if (scope === 'all' && state.queue.items.length && !globalThis.confirm('Clear inactive rows? Active transfers remain tracked, and files on disk are not touched.')) return;
   await send({ type: 'queue/clear', payload: { scope } });
   await refreshQueue();
   render();
@@ -1517,18 +1545,15 @@ async function downloadPost(): Promise<void> {
   if (!route?.postId || !server) return;
   state.post = { ...state.post, busy: true };
   renderContext();
-  const result = await send<{ filename: string; viaFallback: boolean }>({
+  const result = await send<{ filename: string; viaFallback: boolean; post: BooruPost }>({
     type: 'posts/download',
-    payload: { serverId: server.id, postId: route.postId },
+    payload: { serverId: server.id, postId: state.post.post?.id ?? route.postId },
   });
   state.post = { ...state.post, busy: false };
   if (result) {
-    toast(`Saved ${result.filename}`, 'success');
-    await refreshHistory();
-    state.post = {
-      ...state.post,
-      saved: { filename: result.filename, at: new Date().toISOString() },
-    };
+    toast(`Started original file download: ${result.filename}. Track it in the queue.`, 'success');
+    state.post = { ...state.post, post: result.post };
+    await Promise.all([refreshQueue(), refreshHistory()]);
   }
   render();
 }
@@ -1544,20 +1569,42 @@ async function addPostToList(): Promise<void> {
       items: [
         {
           serverId: server.id,
-          postId: route.postId,
+          postId: post?.id ?? route.postId,
           label: post ? postLabel(post) : `#${route.postId}`,
           postUrl: post?.postUrl ?? route.canonicalUrl,
+          expectedFileHash: post?.siteType === 'pawchive' ? post.md5 : null,
         },
       ],
     },
   });
-  if (post) state.thumbnails.set(post.id, post.previewUrl);
+  if (post) state.thumbnails.set(`${post.serverId}:${post.id}`, post.previewUrl);
   await refreshQueue();
   state.post = { ...state.post, queued: true };
   state.dockNotice = {
     text: result?.added ? `${post ? postLabel(post) : `#${route.postId}`} added to the list.` : 'That post is already in the list.',
     tone: result?.added ? 'ok' : 'plain',
   };
+  render();
+}
+
+async function addAllPawchiveFiles(): Promise<void> {
+  const route = state.context.route;
+  const server = state.context.server;
+  if (!route?.postId || !server || server.siteType !== 'pawchive') return;
+  state.post = { ...state.post, busy: true };
+  renderContext();
+  const result = await send<{ added: number; skipped: number; unavailable: number }>({
+    type: 'queue/enqueuePawchivePost',
+    payload: { serverId: server.id, postId: route.postId },
+  });
+  state.post = { ...state.post, busy: false };
+  await refreshQueue();
+  if (result) {
+    const parts = [`${result.added} original file(s) added`];
+    if (result.skipped) parts.push(`${result.skipped} already queued or filtered`);
+    if (result.unavailable) parts.push(`${result.unavailable} unavailable or preview-only`);
+    state.dockNotice = { text: `${parts.join(' · ')}. Press Download selected to start.`, tone: result.unavailable ? 'plain' : 'ok' };
+  }
   render();
 }
 
@@ -1603,6 +1650,7 @@ function openEditor(server: ServerConfigView | null, siteType: string, baseUrl?:
     isNew: !server,
     apiKeyMask: server?.apiKeyMask ?? '',
     validation: null,
+    validatedSignature: null,
     validating: false,
     saving: false,
   };
@@ -1620,30 +1668,71 @@ function hostnameOf(url: string): string {
 }
 
 async function validateDraft(): Promise<void> {
-  if (!state.editor) return;
-  state.editor.validating = true;
+  const editor = state.editor;
+  if (!editor || editor.validating || editor.saving) return;
+  const draft = { ...editor.draft };
+  const submitted = draftValidationSignature(draft);
+  editor.validating = true;
+  editor.validation = null;
+  editor.validatedSignature = null;
   renderServersTab();
-  const result = await send<ValidationResult>({ type: 'servers/validateDraft', payload: { server: state.editor.draft } });
-  if (!state.editor) return;
-  state.editor.validating = false;
-  state.editor.validation = result;
+  const result = await send<ValidationResult>({ type: 'servers/validateDraft', payload: { server: draft } });
+  if (state.editor !== editor) return;
+  editor.validating = false;
+  if (result && draftValidationSignature(editor.draft) === submitted) {
+    editor.validation = result;
+    editor.validatedSignature = submitted;
+    toast(result.ok ? `Validated: ${result.message}` : `Not valid: ${result.message}`, result.ok ? 'success' : 'error', 6000);
+  } else if (result) {
+    toast('The connection changed during validation. Validate the current values again.', 'warning', 6000);
+  }
   renderServersTab();
-  if (result) toast(result.ok ? `Validated: ${result.message}` : `Not valid: ${result.message}`, result.ok ? 'success' : 'error', 6000);
 }
 
 async function saveDraft(options: { force: boolean }): Promise<void> {
-  if (!state.editor) return;
-  state.editor.saving = true;
+  const editor = state.editor;
+  if (!editor || editor.saving || editor.validating) return;
+  const decision = draftSaveDecision(editor, options.force);
+  if (decision === 'blocked') {
+    toast('Validation failed. Use "Save anyway" to store these values.', 'warning', 6000);
+    return;
+  }
+  if (decision === 'validate') {
+    const draft = { ...editor.draft };
+    const submitted = draftValidationSignature(draft);
+    editor.validating = true;
+    editor.validation = null;
+    editor.validatedSignature = null;
+    renderServersTab();
+    const result = await send<ValidationResult>({ type: 'servers/validateDraft', payload: { server: draft } });
+    if (state.editor !== editor) return;
+    editor.validating = false;
+    if (!result || draftValidationSignature(editor.draft) !== submitted) {
+      renderServersTab();
+      toast('Saved nothing: validation did not complete for the current values.', 'warning', 6000);
+      return;
+    }
+    editor.validation = result;
+    editor.validatedSignature = submitted;
+    renderServersTab();
+    if (!result.ok) {
+      toast('Saved nothing yet - validation failed. Use "Save anyway" to store it regardless.', 'warning', 6000);
+      return;
+    }
+  }
+  editor.saving = true;
+  const draft = { ...editor.draft };
   renderServersTab();
-  const saved = await send<ServerConfigView>({ type: 'servers/save', payload: state.editor.draft });
+  const saved = await send<ServerConfigView>({ type: 'servers/save', payload: draft });
+  if (state.editor !== editor) return;
   if (saved) {
     state.editor = null;
     await refreshServers();
     await refreshDiagnostics();
     toast(`Saved ${saved.label}`, 'success');
     render();
-  } else if (state.editor) {
-    state.editor.saving = false;
+  } else {
+    editor.saving = false;
     renderServersTab();
     if (!options.force) toast('Save failed — see the message above', 'error');
   }
@@ -1663,9 +1752,7 @@ async function deleteServer(server: ServerConfigView): Promise<void> {
   const remaining = await send<ServerConfigView[]>({ type: 'servers/remove', payload: { id: server.id } });
   if (remaining) {
     state.servers = remaining;
-    if (!remaining.some((entry) => entry.id === state.listing.serverId)) {
-      state.listing.serverId = remaining.find((entry) => entry.isDefault)?.id ?? remaining[0]?.id ?? null;
-    }
+    await refreshServers();
     await refreshDiagnostics();
     render();
   }
@@ -1697,41 +1784,71 @@ async function syncUserAgent(): Promise<void> {
 
 // ------------------------------------------------------------- settings actions
 
+const settingsUpdates = new OrderedUpdates();
+const pendingSettingsFields = new Set<keyof ExtensionSettings>();
+
+function applyConfirmedSettings(settings: ExtensionSettings): void {
+  state.settings = settings;
+  if (pendingSettingsFields.has('theme')) applyTheme(settings.theme);
+  if (pendingSettingsFields.has('maxConcurrency')) state.queue.maxConcurrency = settings.maxConcurrency;
+  if (pendingSettingsFields.has('mediaFilter')) state.listing.media = settings.mediaFilter;
+  if (pendingSettingsFields.has('skipDownloaded')) state.listing.skipDownloaded = settings.skipDownloaded;
+  pendingSettingsFields.clear();
+}
+
 async function patchSettings(patch: Partial<ExtensionSettings>): Promise<void> {
-  const saved = await send<ExtensionSettings>({ type: 'settings/save', payload: patch });
-  if (!saved) return;
-  state.settings = saved;
-  if (patch.theme) applyTheme(saved.theme);
-  if (patch.maxConcurrency) state.queue.maxConcurrency = saved.maxConcurrency;
-  if (patch.mediaFilter) state.listing.media = saved.mediaFilter;
-  if (patch.skipDownloaded !== undefined) state.listing.skipDownloaded = saved.skipDownloaded;
-  if (patch.searchHistoryEnabled !== undefined || patch.searchHistoryLimit !== undefined) await refreshSuggestions();
-  render();
+  if (!state.settings) return;
+  // Keep the editor current while prior storage writes are in flight. Otherwise
+  // an older response can replace text the user has already typed.
+  for (const key of Object.keys(patch) as Array<keyof ExtensionSettings>) pendingSettingsFields.add(key);
+  state.settings = { ...state.settings, ...patch };
+  if (patch.theme) applyTheme(patch.theme);
+  if (patch.maxConcurrency) state.queue.maxConcurrency = patch.maxConcurrency;
+  if (patch.mediaFilter) state.listing.media = patch.mediaFilter;
+  if (patch.skipDownloaded !== undefined) state.listing.skipDownloaded = patch.skipDownloaded;
+  await settingsUpdates.run(
+    () => send<ExtensionSettings>({ type: 'settings/save', payload: patch }),
+    async (saved, isLatest) => {
+      if (patch.searchHistoryEnabled !== undefined || patch.searchHistoryLimit !== undefined) await refreshSuggestions();
+      if (!isLatest()) return;
+      const current = saved ?? await send<ExtensionSettings>({ type: 'settings/get' });
+      if (!isLatest()) return;
+      if (current) applyConfirmedSettings(current);
+      render();
+    },
+  );
 }
 
 async function saveSettingsAll(): Promise<void> {
+  const snapshot = { ...state.settings };
   state.savingSettings = true;
   renderSettingsTab();
-  const saved = await send<ExtensionSettings>({ type: 'settings/save', payload: state.settings ?? {} });
-  state.savingSettings = false;
-  if (saved) {
-    state.settings = saved;
-    toast('Settings saved — User-Agent rules re-applied', 'success');
-  }
-  render();
+  await settingsUpdates.run(
+    () => send<ExtensionSettings>({ type: 'settings/save', payload: snapshot }),
+    (saved, isLatest) => {
+      state.savingSettings = false;
+      if (saved) {
+        if (isLatest()) applyConfirmedSettings(saved);
+        toast('Settings saved — User-Agent rules re-applied', 'success');
+      }
+      if (isLatest()) render();
+    },
+  );
 }
 
 async function resetSettings(): Promise<void> {
   if (!globalThis.confirm('Reset every setting to its default? Saved servers and keys are kept.')) return;
-  const saved = await send<ExtensionSettings>({ type: 'settings/reset' });
-  if (saved) {
-    state.settings = saved;
-    state.listing.media = saved.mediaFilter;
-    state.listing.skipDownloaded = saved.skipDownloaded;
-    applyTheme(saved.theme);
-    toast('Settings reset to defaults', 'success');
-  }
-  render();
+  for (const field of ['theme', 'maxConcurrency', 'mediaFilter', 'skipDownloaded'] as const) pendingSettingsFields.add(field);
+  await settingsUpdates.run(
+    () => send<ExtensionSettings>({ type: 'settings/reset' }),
+    (saved, isLatest) => {
+      if (saved) {
+        if (isLatest()) applyConfirmedSettings(saved);
+        toast('Settings reset to defaults', 'success');
+      }
+      if (isLatest()) render();
+    },
+  );
 }
 
 async function exportServers(includeSecrets: boolean): Promise<void> {
@@ -1786,13 +1903,23 @@ function renderServersTab(): void {
           : '',
         validation: editor.validation,
         validating: editor.validating,
-        validatedCurrentValues: editor.validation?.ok === true,
+        validatedCurrentValues: editor.validatedSignature === draftValidationSignature(editor.draft),
         saving: editor.saving,
       },
       {
         onChange: (patch) => {
-          if (!state.editor) return;
-          state.editor.draft = { ...state.editor.draft, ...patch };
+          if (state.editor !== editor || editor.saving) return;
+          const before = draftValidationSignature(editor.draft);
+          const previousSiteType = editor.draft.siteType;
+          editor.draft = { ...editor.draft, ...patch };
+          if (patch.siteType && patch.siteType !== previousSiteType) {
+            editor.draft = withSiteDefaults(editor.draft, patch.siteType, state.adapters);
+            editor.apiKeyMask = '';
+          }
+          if (draftValidationSignature(editor.draft) !== before) {
+            editor.validation = null;
+            editor.validatedSignature = null;
+          }
           renderServersTab();
         },
         onValidate: () => void validateDraft(),
@@ -1809,6 +1936,8 @@ function renderServersTab(): void {
             baseUrl: state.editor.draft.baseUrl,
           });
           state.editor.draft = { ...state.editor.draft, customUserAgent: suggested ?? '' };
+          state.editor.validation = null;
+          state.editor.validatedSignature = null;
           renderServersTab();
         },
         onBackToList: () => {
@@ -1817,7 +1946,7 @@ function renderServersTab(): void {
         },
       },
     );
-    els.serversHost.replaceChildren(...(Array.from(host.children) as HTMLElement[]));
+    preserveInputFocus(els.serversHost, () => els.serversHost.replaceChildren(...(Array.from(host.children) as HTMLElement[])));
     return;
   }
 
@@ -1825,7 +1954,7 @@ function renderServersTab(): void {
   const listHost = h('div');
   renderServerList(
     listHost,
-    { servers: state.servers, adapters: state.adapters, busyId: state.busyId, filter: '' },
+    { servers: state.servers, adapters: state.adapters, busyId: state.busyId, filter: state.serverFilter },
     {
       onAdd: (siteType?: string) => openEditor(null, siteType ?? 'e621'),
       onEdit: (server) => openEditor(server, server.siteType),
@@ -1841,7 +1970,10 @@ function renderServersTab(): void {
         }
       },
       onTest: (server) => void validateServer(server),
-      onFilterChange: () => undefined,
+      onFilterChange: (value) => {
+        state.serverFilter = value;
+        renderServersTab();
+      },
       onOpenQueue: () => switchTab('queue'),
     },
   );
@@ -1850,20 +1982,20 @@ function renderServersTab(): void {
   // Diagnostics live here too: "why did this profile fail" belongs next to the list.
   if (state.diagnostics) {
     const details = h('details', { class: 'psCard psDiagnostics' });
-    details.appendChild(h('summary', { text: 'Diagnostics — adapter capabilities, environment, validation traces (no credentials)' }));
+    details.appendChild(h('summary', { text: 'Diagnostics — adapter capabilities, environment, redacted traces (review before sharing)' }));
     const host = h('div');
     renderDiagnostics(host, state.diagnostics, {
       onSyncUserAgent: () => void syncUserAgent(),
       onCopy: () => {
         copyDiagnostics(state.diagnostics!);
-        toast('Diagnostics copied (credential-free)', 'success');
+        toast('Diagnostics copied — review before sharing', 'success');
       },
       onOpenApiDocs: (url: string) => globalThis.open(url, '_blank', 'noreferrer'),
     });
     for (const child of Array.from(host.children)) details.appendChild(child);
     container.appendChild(details);
   }
-  els.serversHost.replaceChildren(...(Array.from(container.children) as HTMLElement[]));
+  preserveInputFocus(els.serversHost, () => els.serversHost.replaceChildren(...(Array.from(container.children) as HTMLElement[])));
 }
 
 // ------------------------------------------------------------------ settings tab
@@ -1899,7 +2031,7 @@ function renderSettingsTab(): void {
       onOpenServers: () => switchTab('servers'),
     },
   );
-  els.settingsHost.replaceChildren(...(Array.from(host.children) as HTMLElement[]));
+  preserveInputFocus(els.settingsHost, () => els.settingsHost.replaceChildren(...(Array.from(host.children) as HTMLElement[])));
 }
 
 // ---------------------------------------------------------------------- start

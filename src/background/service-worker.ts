@@ -2,8 +2,8 @@
  * MV3 background service worker.
  *
  * Responsibilities:
- *  - own every network request (the extension has host permissions, pages do not)
- *  - own stored credentials (the UI only ever receives masked views)
+ *  - handle API requests (images and Chrome Downloads can also contact hosts)
+ *  - own stored profile credentials (server views are masked; typed drafts are not)
  *  - answer UI/content-script messages through the shared router
  *  - keep declarativeNetRequest User-Agent rules in sync with saved servers
  *
@@ -11,7 +11,7 @@
  */
 import { registerBuiltinAdapters } from '../adapters/index.js';
 import { BooruClient } from '../core/client.js';
-import { ChromeDownloader } from '../core/downloads.js';
+import { ChromeDownloader, PawchivePacedDownloader } from '../core/downloads.js';
 import type { UiRequest } from '../core/messages.js';
 import { DownloadHistoryStore, SearchHistoryStore } from '../core/history.js';
 import { MirrorLinkStore } from '../core/link-store.js';
@@ -36,12 +36,25 @@ const servers = new ServerStore(area);
 const http = new HttpClient({ maxRetries: 3 });
 const validation = new ValidationService(http);
 const client = new BooruClient({ servers, settings, http, validation });
-const downloader = new ChromeDownloader();
+const downloader = new PawchivePacedDownloader(new ChromeDownloader());
 const history = new DownloadHistoryStore(area);
 const searches = new SearchHistoryStore(area);
 const links = new MirrorLinkStore(area);
 const tasks = new TaskStore(area);
 const queue = new DownloadQueue({ storage: area, client, servers, settings, downloader, history, links, tasks });
+
+// MV3 listeners must be registered synchronously on every worker startup. The
+// ID is persisted by the queue; a search after registration closes the race in
+// which Chrome finishes before the start callback returns or storage is written.
+globalThis.chrome?.downloads?.onChanged?.addListener((delta) => {
+  void queue.handleDownloadChanged(delta.id).catch(() => console.warn('[booru] download reconciliation failed; it will be retried.'));
+});
+globalThis.chrome?.downloads?.onErased?.addListener((id) => {
+  void queue.handleDownloadChanged(id).catch(() => console.warn('[booru] erased download reconciliation failed; it will be retried.'));
+});
+void queue.recover().catch(() => console.warn('[booru] queue recovery failed; open the queue to retry.'));
+// Clean old Hydrus key-bearing history URLs even before the notebook is opened.
+void history.list().catch(() => console.warn('[booru] history cleanup failed; opening history will retry it.'));
 
 const handle = createRouter({
   client,

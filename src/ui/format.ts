@@ -45,7 +45,7 @@ export function accountLine(server: ServerConfigView): HTMLElement {
   const pieces: string[] = [];
   if (server.username) pieces.push(server.username);
   if (server.userId) pieces.push(`id ${server.userId}`);
-  const label = pieces.length ? `Signed in: ${pieces.join(' · ')}` : 'No account saved (read-only)';
+  const label = pieces.length ? `Signed in: ${pieces.join(' · ')}` : server.hasApiKey ? 'API key saved' : 'No account saved (read-only)';
   const status =
     server.validationStatus === 'valid'
       ? 'verified'

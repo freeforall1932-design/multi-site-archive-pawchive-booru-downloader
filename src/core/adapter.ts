@@ -26,7 +26,7 @@ export interface AdapterContext {
   baseUrl: string;
 }
 
-export type AuthStyle = 'basic' | 'query' | 'basic-or-query' | 'query-with-userid';
+export type AuthStyle = 'basic' | 'query' | 'basic-or-query' | 'query-with-userid' | 'header';
 
 export interface AdapterCapabilities {
   /** Read endpoints work without credentials. */
@@ -123,7 +123,8 @@ export interface AdapterDefaults {
  * THE SHARED BOORU ADAPTER CONTRACT.
  *
  * Adding a booru-like site = implement this interface + register it
- * (`src/adapters/index.ts`). No UI or service code branches on site type; see
+ * (`src/adapters/index.ts`). Cross-site behavior is shared where possible;
+ * Pawchive's attachment, pacing and task policies have explicit branches. See
  * docs/ADAPTER_CONTRACT.md for a step-by-step guide and the conformance tests
  * in tests/adapters/contract.test.ts.
  */

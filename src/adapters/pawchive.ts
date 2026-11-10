@@ -3,71 +3,85 @@ import { BooruError } from '../shared/errors.js';
 import type { HttpResponseSnapshot, HttpRequestSpec } from '../shared/http.js';
 import type { BooruPost, Rating, RouteMatch, SearchResult, SearchSpec, SiteType } from '../shared/types.js';
 import { asRecord, classifyStatus, pickString, readJson, shapeError } from './base.js';
-import { hostMatchesPattern, unique } from '../shared/util.js';
+import { hostMatchesPattern, safeUrl, unique } from '../shared/util.js';
 
-export const KEMONO_VERSION = '0.1.0';
-/** Kemono's API always pages by 50. */
-export const KEMONO_PAGE_SIZE = 50;
+export const PAWCHIVE_VERSION = '0.2.0';
+const PAWCHIVE_USER_AGENT = `BooruServerManager/${PAWCHIVE_VERSION} (+https://github.com/freeforall1932-design/multi-site-archive-pawchive-booru-downloader)`;
+/** Pawchive's API pages by 50 posts. */
+export const PAWCHIVE_PAGE_SIZE = 50;
 
 const SITE_RATING_TOKENS: readonly string[] = [];
 const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'bmp'];
 const VIDEO_EXTS = ['mp4', 'webm', 'mov', 'mkv', 'm4v'];
+const PAWCHIVE_DOMAINS = ['pawchive.pw', 'pawchive.st'];
 
-export interface KemonoOptions {
+interface PawchiveOptions {
   siteType: SiteType;
   displayName: string;
   baseUrl: string;
   label: string;
   hostPatterns: string[];
   notes?: string[];
-  /**
-   * Where `/data/<path>` files are served. Kemono serves them from the site
-   * host (which redirects to a CDN node); Pawchive names the node per file
-   * (`node: 2` → `https://n2.pawchive.pw`). Receives the file's node, if any.
-   */
-  fileHost?: (baseUrl: string, node: number | null) => string;
-  /** Where `/thumbnail/data/<path>` previews are served (defaults to the site host). */
-  thumbnailHost?: (baseUrl: string) => string;
+  fileHost: (baseUrl: string, node: number | null) => string;
+  thumbnailHost: (baseUrl: string) => string;
 }
 
-/**
- * Composite post ids. Kemono posts are addressed by service + creator + post,
- * and one post carries many attachments, so a downloadable row is
- * `service/creator/post/attachmentIndex`. Without the index the primary file
- * (`post.file`) is meant.
- */
-export interface KemonoPostRef {
+/** Only official Pawchive domains, including the site's former domain. */
+export function isPawchiveHost(hostname: string, includeSubdomains = false): boolean {
+  const host = hostname.toLowerCase();
+  return PAWCHIVE_DOMAINS.some((domain) => host === domain || (includeSubdomains && host.endsWith(`.${domain}`)));
+}
+
+/** A Pawchive profile must not be used as a generic archive-site adapter. */
+export function normalizePawchiveBaseUrl(raw: string): string {
+  const value = raw.trim();
+  const parsed = safeUrl(/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`);
+  const host = parsed?.hostname.replace(/^www\./, '') ?? '';
+  if (!parsed || parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.port || !isPawchiveHost(host)) {
+    throw new BooruError('Pawchive profiles require an official Pawchive HTTPS URL', {
+      kind: 'unsupported-site',
+      hint: 'Use https://pawchive.pw (or the previous pawchive.st domain). Booru profiles are configured separately.',
+    });
+  }
+  return `https://${host}`;
+}
+
+/** A row is addressed by service, creator, post and optionally file index. */
+export interface PawchivePostRef {
   service: string;
   user: string;
   post: string;
   index: number | null;
 }
 
-export function parseKemonoPostId(postId: string): KemonoPostRef | null {
+export function parsePawchivePostId(postId: string): PawchivePostRef | null {
   const parts = postId.split('/').filter(Boolean);
   if (parts.length < 3 || parts.length > 4) return null;
   const [service, user, post, index] = parts;
-  if (!service || !user || !post) return null;
-  if (index !== undefined && !/^\d+$/.test(index)) return null;
+  if (!service || !user || !post || (index !== undefined && !/^\d+$/.test(index))) return null;
   return { service, user, post, index: index === undefined ? null : Number(index) };
 }
 
-export function formatKemonoPostId(ref: KemonoPostRef): string {
+export function formatPawchivePostId(ref: PawchivePostRef): string {
   return `${ref.service}/${ref.user}/${ref.post}${ref.index === null ? '' : `/${ref.index}`}`;
 }
 
-/**
- * What the user may type in the tag box:
- *   - `service/creatorId` (or a pasted creator URL)  → that creator's posts
- *   - `tag:foo`                                       → posts tagged foo
- *   - anything else                                   → full-text title search (`q`)
- */
-export function parseKemonoQuery(raw: string | undefined): { kind: 'creator'; service: string; user: string } | { kind: 'tag'; tag: string } | { kind: 'text'; q: string } {
+/** A creator URL or service/id, a `tag:name`, or a title query. */
+export function parsePawchiveQuery(raw: string | undefined): { kind: 'creator'; service: string; user: string } | { kind: 'tag'; tag: string } | { kind: 'text'; q: string } {
   const text = (raw ?? '').trim();
-  const creatorUrl = /(?:^|\/)([a-z0-9_-]+)\/user\/([^/?#\s]+)/i.exec(text);
+  let path = text;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) {
+    const url = safeUrl(text);
+    const host = url?.hostname.replace(/^www\./, '') ?? '';
+    if (!url || url.protocol !== 'https:' || url.port || url.username || url.password || !isPawchiveHost(host)) {
+      throw new BooruError('Only Pawchive creator URLs are supported', { kind: 'unsupported-site', hint: 'Paste a Pawchive creator URL or use service/creatorId.' });
+    }
+    path = url.pathname;
+  }
+  const creatorUrl = /^\/?([a-z0-9_-]+)\/user\/([^/?#\s]+)/i.exec(path);
   if (creatorUrl) return { kind: 'creator', service: creatorUrl[1]!.toLowerCase(), user: creatorUrl[2]! };
   const creatorShort = /^([a-z0-9_-]+)\/([^/\s]+)$/i.exec(text);
-  if (creatorShort && !text.includes(' ')) return { kind: 'creator', service: creatorShort[1]!.toLowerCase(), user: creatorShort[2]! };
+  if (creatorShort) return { kind: 'creator', service: creatorShort[1]!.toLowerCase(), user: creatorShort[2]! };
   const tag = /^tag:(.+)$/i.exec(text);
   if (tag) return { kind: 'tag', tag: tag[1]!.trim() };
   return { kind: 'text', q: text };
@@ -78,55 +92,79 @@ function classifyFailure(snapshot: HttpResponseSnapshot, displayName: string): A
 }
 
 function fileUrlFor(host: string, path: string, name: string | null): string {
-  const url = new URL(`${host.replace(/\/+$/, '')}/data${path.startsWith('/') ? path : `/${path}`}`);
+  const cleanPath = path.replace(/^\/+/, '').replace(/^data\//, '');
+  const url = new URL(`${host.replace(/\/+$/, '')}/data/${cleanPath}`);
   if (name) url.searchParams.set('f', name);
   return url.toString();
 }
 
-function thumbnailFor(host: string, path: string, ext: string | null): string | null {
-  if (!ext || !IMAGE_EXTS.includes(ext)) return null;
-  return `${host.replace(/\/+$/, '')}/thumbnail/data${path.startsWith('/') ? path : `/${path}`}`;
+function thumbnailFor(host: string, path: string): string {
+  const cleanPath = path.replace(/^\/+/, '').replace(/^(?:thumbnail\/)?data\//, '');
+  return `${host.replace(/\/+$/, '')}/thumbnail/data/${cleanPath}`;
 }
 
-function extOf(name: string | null, path: string): string | null {
-  const source = name && /\.[a-z0-9]{1,5}$/i.test(name) ? name : path;
+function extOf(name: string | null, path: string | null): string | null {
+  const source = name && /\.[a-z0-9]{1,5}$/i.test(name) ? name : path ?? '';
   const match = /\.([a-z0-9]{1,5})$/i.exec(source);
   return match?.[1]?.toLowerCase() ?? null;
 }
 
-interface KemonoFile {
+interface PawchiveFile {
   name: string | null;
-  path: string;
-  /** Storage node hint (Pawchive); null when the site does not expose one. */
+  path: string | null;
   node: number | null;
-  /** The site only holds a preview rendition of this file (Pawchive `preview_only`). */
   previewOnly: boolean;
+  deferred: boolean;
+  tempUrl: string | null;
+  tempExpires: string | null;
 }
 
-/** Per-site URL resolution shared by listing and single-post parsing. */
-interface KemonoHosts {
+interface PawchiveHosts {
   fileHost: (baseUrl: string, node: number | null) => string;
   thumbnailHost: (baseUrl: string) => string;
 }
 
-const DEFAULT_HOSTS: KemonoHosts = { fileHost: (baseUrl) => baseUrl, thumbnailHost: (baseUrl) => baseUrl };
+const DEFAULT_HOSTS: PawchiveHosts = {
+  fileHost: (baseUrl) => `https://file.${new URL(baseUrl).hostname.replace(/^www\./, '')}`,
+  thumbnailHost: (baseUrl) => `https://img.${new URL(baseUrl).hostname.replace(/^www\./, '')}`,
+};
 
-/** Primary file first, then attachments, de-duplicated by storage path. */
-function collectFiles(post: Record<string, unknown>, extraAttachments: unknown[] = []): KemonoFile[] {
-  const seen = new Set<string>();
-  const out: KemonoFile[] = [];
+/** Keep unavailable entries in the index so listing and post lookup agree. */
+function collectFiles(post: Record<string, unknown>, extraAttachments: unknown[] = []): PawchiveFile[] {
+  const seen = new Map<string, number>();
+  const out: PawchiveFile[] = [];
   const push = (raw: unknown) => {
     const record = asRecord(raw);
-    const path = record ? pickString(record, 'path') : null;
-    if (!path || seen.has(path)) return;
-    seen.add(path);
-    const nodeRaw = record?.node;
-    out.push({
-      name: record ? pickString(record, 'name') : null,
-      path,
+    if (!record) return;
+    const path = pickString(record, 'path');
+    const tempUrl = pickString(record, 'temp_url');
+    const name = pickString(record, 'name');
+    if (!path && !tempUrl && !name) return;
+    const nodeRaw = record.node;
+    const file: PawchiveFile = {
+      name, path, tempUrl,
       node: typeof nodeRaw === 'number' && Number.isFinite(nodeRaw) ? nodeRaw : null,
-      previewOnly: record?.preview_only === true,
-    });
+      previewOnly: record.preview_only === true,
+      deferred: record.deferred === true,
+      tempExpires: pickString(record, 'temp_expires'),
+    };
+    const key = path ? `path:${path}` : tempUrl ? `url:${tempUrl}` : null;
+    const existing = key ? seen.get(key) : undefined;
+    if (existing !== undefined) {
+      const previous = out[existing]!;
+      const useIncomingTemp = !usableTempUrl(previous) && !!usableTempUrl(file);
+      out[existing] = {
+        ...previous,
+        name: previous.name ?? file.name,
+        tempUrl: useIncomingTemp ? file.tempUrl : previous.tempUrl ?? file.tempUrl,
+        tempExpires: useIncomingTemp || !previous.tempUrl ? file.tempExpires : previous.tempExpires,
+        previewOnly: previous.previewOnly || file.previewOnly,
+        deferred: previous.deferred && file.deferred,
+      };
+      return;
+    }
+    if (key) seen.set(key, out.length);
+    out.push(file);
   };
   push(post.file);
   for (const attachment of Array.isArray(post.attachments) ? post.attachments : []) push(attachment);
@@ -134,27 +172,50 @@ function collectFiles(post: Record<string, unknown>, extraAttachments: unknown[]
   return out;
 }
 
-function buildPost(post: Record<string, unknown>, file: KemonoFile, index: number, ctx: AdapterContext, hosts: KemonoHosts = DEFAULT_HOSTS): BooruPost {
+/** Signed URLs are bearer links: accept only HTTPS on Pawchive, never mutate their query. */
+function usableTempUrl(file: PawchiveFile): string | null {
+  if (!file.tempUrl) return null;
+  const url = safeUrl(file.tempUrl);
+  if (!url || url.protocol !== 'https:' || url.username || url.password || url.port || !isPawchiveHost(url.hostname, true)) return null;
+  if (file.tempExpires) {
+    // Pawchive may omit a timezone; interpret those timestamps as UTC.
+    const timestamp = /(?:z|[+-]\d\d:?\d\d)$/i.test(file.tempExpires) ? file.tempExpires : `${file.tempExpires}Z`;
+    const expires = Date.parse(timestamp);
+    if (Number.isFinite(expires) && expires <= Date.now()) return null;
+  }
+  return file.tempUrl;
+}
+
+function buildPost(post: Record<string, unknown>, file: PawchiveFile, index: number, ctx: AdapterContext, hosts: PawchiveHosts): BooruPost | null {
+  if (file.deferred) return null;
+  const signed = usableTempUrl(file);
+  if (!signed && !file.path) return null;
   const service = pickString(post, 'service') ?? 'unknown';
   const user = pickString(post, 'user') ?? '';
   const postId = pickString(post, 'id') ?? '';
-  const ext = extOf(file.name, file.path);
+  const originalExt = extOf(file.name, file.path ?? safeUrl(signed ?? '')?.pathname ?? null);
   const tagsRaw = post.tags;
   const tags = Array.isArray(tagsRaw)
     ? unique(tagsRaw.filter((tag): tag is string => typeof tag === 'string' && !!tag.trim()))
     : typeof tagsRaw === 'string'
       ? unique(tagsRaw.replace(/^\{|\}$/g, '').split(',').map((tag) => tag.trim()).filter(Boolean))
       : [];
-  const fileUrl = fileUrlFor(hosts.fileHost(ctx.baseUrl, file.node), file.path, file.name);
-  // Storage paths are `/ab/cd/<sha256>.<ext>`; keep the hash where the UI shows md5 (labelled as such in notes).
-  const hash = /\/([a-f0-9]{64})\.[a-z0-9]+$/i.exec(file.path)?.[1] ?? null;
+  const thumbnail = file.path ? thumbnailFor(hosts.thumbnailHost(ctx.baseUrl), file.path) : null;
+  // Never expose a known preview as a downloadable original, even if a signed
+  // URL is present. Keep a row so the user can see that the original is missing.
+  const degraded = file.previewOnly || post.has_full === false;
+  const fileUrl = degraded ? '' : signed ?? fileUrlFor(hosts.fileHost(ctx.baseUrl, file.node), file.path!, file.name);
+  const ext = originalExt;
+  const hash = file.path ? /\/([a-f0-9]{64})\.[a-z0-9]+$/i.exec(file.path)?.[1] ?? null : null;
+  const title = pickString(post, 'title');
   return {
     serverId: ctx.server.id,
     siteType: ctx.server.siteType,
-    id: formatKemonoPostId({ service, user, post: postId, index }),
+    id: formatPawchivePostId({ service, user, post: postId, index }),
     postUrl: `${ctx.baseUrl}/${service}/user/${user}/post/${postId}`,
     fileUrl,
-    previewUrl: thumbnailFor(hosts.thumbnailHost(ctx.baseUrl), file.path, ext) ?? fileUrl,
+    // Never make an <img> request for a full archive, video, or signed file.
+    previewUrl: thumbnail && (degraded || (originalExt && IMAGE_EXTS.includes(originalExt))) ? thumbnail : '',
     sampleUrl: null,
     width: null,
     height: null,
@@ -174,15 +235,51 @@ function buildPost(post: Record<string, unknown>, file: KemonoFile, index: numbe
     isAnimated: !!ext && (ext === 'gif' || VIDEO_EXTS.includes(ext)),
     parentId: postId,
     hasChildren: false,
-    description: file.previewOnly ? `${pickString(post, 'title') ?? ''} [preview only]`.trim() : pickString(post, 'title'),
+    description: degraded || file.previewOnly ? `${title ?? ''} [preview only]`.trim() : title,
+    fileAvailability: degraded || file.previewOnly ? 'preview' : signed ? 'temporary' : 'full',
   };
 }
 
-/** Expand one Kemono post into one row per file (posts without files yield nothing). */
-export function expandKemonoPost(raw: unknown, ctx: AdapterContext, hosts: KemonoHosts = DEFAULT_HOSTS): BooruPost[] {
-  const post = asRecord(raw);
-  if (!post) return [];
-  return collectFiles(post).map((file, index) => buildPost(post, file, index, ctx, hosts));
+/** Expand attachment slots from either the classic or wrapped single-post API. */
+export function inspectPawchivePost(raw: unknown, ctx: AdapterContext, hosts: PawchiveHosts = DEFAULT_HOSTS): { posts: BooruPost[]; unavailable: number } {
+  const record = asRecord(raw);
+  const wrapped = record && asRecord(record.post);
+  const post = wrapped ?? record;
+  if (!post) return { posts: [], unavailable: 0 };
+  const extra = wrapped && Array.isArray(record?.attachments) ? record.attachments : [];
+  const files = collectFiles(post, extra);
+  const posts: BooruPost[] = [];
+  for (const [index, file] of files.entries()) {
+    const normalized = buildPost(post, file, index, ctx, hosts);
+    if (normalized) posts.push(normalized);
+  }
+  return { posts, unavailable: files.length - posts.length };
+}
+
+/** Expand visible files while keeping their original stable indices. */
+export function expandPawchivePost(raw: unknown, ctx: AdapterContext, hosts: PawchiveHosts = DEFAULT_HOSTS): BooruPost[] {
+  return inspectPawchivePost(raw, ctx, hosts).posts;
+}
+
+/** References include text-only/deferred posts, which can still contain mirror links. */
+function sourcePostRef(raw: unknown, ctx: AdapterContext): Array<{ id: string; label: string; postUrl: string }> {
+  const record = asRecord(raw);
+  const post = (record && asRecord(record.post)) ?? record;
+  const service = pickString(post, 'service');
+  const user = pickString(post, 'user');
+  const postId = pickString(post, 'id');
+  if (!service || !user || !postId) return [];
+  const id = formatPawchivePostId({ service, user, post: postId, index: null });
+  return [{ id, label: pickString(post, 'title') ?? `#${id}`, postUrl: `${ctx.baseUrl}/${service}/user/${user}/post/${postId}` }];
+}
+
+function postList(raw: unknown): unknown[] | null {
+  if (Array.isArray(raw)) return raw;
+  const record = asRecord(raw);
+  for (const key of ['posts', 'data', 'results']) {
+    if (Array.isArray(record?.[key])) return record[key] as unknown[];
+  }
+  return null;
 }
 
 function interpretEndpointProbe(snapshot: HttpResponseSnapshot, displayName: string): ProbeInterpretation {
@@ -195,31 +292,18 @@ function interpretEndpointProbe(snapshot: HttpResponseSnapshot, displayName: str
     const booruError = error as BooruError;
     return { ok: false, kind: booruError.kind, message: booruError.message, warnings: booruError.hint ? [booruError.hint] : [] };
   }
-  const record = asRecord(parsed);
-  const list = Array.isArray(parsed) ? parsed : record && Array.isArray(record.posts) ? record.posts : null;
+  const list = postList(parsed);
   if (!list) {
     return { ok: false, kind: 'endpoint-mismatch', message: `${displayName} answered with JSON, but not a posts listing`, warnings: ['Expected `{"count": N, "posts": […]}` at /api/v1/posts.'] };
   }
   return { ok: true, kind: 'ok', message: `Endpoint OK - /api/v1/posts responded with ${list.length} post(s)` };
 }
 
-/**
- * Kemono / Coomer adapter (https://kemono.cr, https://coomer.st).
- *
- * Not a tag booru: content is organised by *service* (patreon, fanbox, …) and
- * *creator*. The adapter maps every attachment to one downloadable row.
- *
- * - Listing: `/api/v1/posts?q=…&o=offset` (site-wide text search, 50 per page),
- *   `/api/v1/posts?tag=…`, or `/api/v1/{service}/user/{id}/posts?o=offset`.
- * - Single post: `/api/v1/{service}/user/{id}/post/{postId}`.
- * - Files: `/data/{path}?f={name}` on the site host (redirects to a CDN node).
- * - No authentication and no ratings. The API is undocumented and has changed
- *   before; validation confirms the current shape before anything is queued.
- */
-export function createKemonoAdapter(options: KemonoOptions): BooruAdapter {
+/** Pawchive's public creator archive API, independent of the booru adapters. */
+function createPawchiveAdapter(options: PawchiveOptions): BooruAdapter {
   const displayName = options.displayName;
   const matchesHost = (host: string): boolean => options.hostPatterns.some((pattern) => hostMatchesPattern(host, pattern));
-  const hosts: KemonoHosts = {
+  const hosts: PawchiveHosts = {
     fileHost: options.fileHost ?? DEFAULT_HOSTS.fileHost,
     thumbnailHost: options.thumbnailHost ?? DEFAULT_HOSTS.thumbnailHost,
   };
@@ -239,7 +323,7 @@ export function createKemonoAdapter(options: KemonoOptions): BooruAdapter {
       requiresUserAgent: false,
       authStyle: 'query',
       supportsBasicAuthHeader: false,
-      maxPostsPerRequest: KEMONO_PAGE_SIZE,
+      maxPostsPerRequest: PAWCHIVE_PAGE_SIZE,
       maxPage: null,
       minRequestIntervalMs: 1500,
       supportsPostLookup: true,
@@ -259,11 +343,11 @@ export function createKemonoAdapter(options: KemonoOptions): BooruAdapter {
       baseUrl: options.baseUrl,
       label: options.label,
       ratings: ['general', 'safe', 'sensitive', 'questionable', 'explicit'],
-      userAgentHint: `BooruServerManager/${KEMONO_VERSION}`,
+      userAgentHint: PAWCHIVE_USER_AGENT,
     },
 
     normalizeBaseUrl(raw: string): string {
-      return raw.trim().replace(/\/+$/, '').replace(/\/(api\/v1.*|posts|artists|[a-z0-9_-]+\/user\/.*)$/i, '');
+      return normalizePawchiveBaseUrl(raw);
     },
 
     matchesHost,
@@ -275,14 +359,14 @@ export function createKemonoAdapter(options: KemonoOptions): BooruAdapter {
       } catch {
         return null;
       }
-      if (!matchesHost(parsed.host)) return null;
+      if (parsed.protocol !== 'https:' || parsed.port || !matchesHost(parsed.host)) return null;
       const segments = parsed.pathname.split('/').filter(Boolean);
       const canonicalUrl = `${parsed.origin}${parsed.pathname}`;
       if (segments[1] === 'user' && segments[2] && segments[3] === 'post' && segments[4]) {
         return {
           siteType: options.siteType,
           kind: 'post',
-          postId: formatKemonoPostId({ service: segments[0]!, user: segments[2], post: segments[4], index: null }),
+          postId: formatPawchivePostId({ service: segments[0]!, user: segments[2], post: segments[4], index: null }),
           tags: null,
           page: null,
           canonicalUrl,
@@ -295,7 +379,7 @@ export function createKemonoAdapter(options: KemonoOptions): BooruAdapter {
           kind: 'search',
           postId: null,
           tags: `${segments[0]}/${segments[2]}`,
-          page: offset && /^\d+$/.test(offset) ? Math.floor(Number(offset) / KEMONO_PAGE_SIZE) + 1 : null,
+          page: offset && /^\d+$/.test(offset) ? Math.floor(Number(offset) / PAWCHIVE_PAGE_SIZE) + 1 : null,
           canonicalUrl,
         };
       }
@@ -308,15 +392,15 @@ export function createKemonoAdapter(options: KemonoOptions): BooruAdapter {
     },
 
     postUrl(baseUrl: string, postId: string): string {
-      const ref = parseKemonoPostId(postId);
+      const ref = parsePawchivePostId(postId);
       if (!ref) return `${baseUrl.replace(/\/+$/, '')}/posts`;
       return `${baseUrl.replace(/\/+$/, '')}/${ref.service}/user/${ref.user}/post/${ref.post}`;
     },
 
     buildSearchRequest(ctx, spec): HttpRequestSpec {
       const page = Math.max(spec.page ?? 1, 1);
-      const offset = (page - 1) * KEMONO_PAGE_SIZE;
-      const query = parseKemonoQuery(spec.tags);
+      const offset = (page - 1) * PAWCHIVE_PAGE_SIZE;
+      const query = parsePawchiveQuery(spec.tags);
       let url: URL;
       if (query.kind === 'creator') {
         url = new URL(`${ctx.baseUrl}/api/v1/${encodeURIComponent(query.service)}/user/${encodeURIComponent(query.user)}/posts`);
@@ -330,11 +414,11 @@ export function createKemonoAdapter(options: KemonoOptions): BooruAdapter {
     },
 
     buildPostRequest(ctx, postId): HttpRequestSpec {
-      const ref = parseKemonoPostId(postId);
+      const ref = parsePawchivePostId(postId);
       if (!ref) {
         throw new BooruError(`"${postId}" is not a ${displayName} post id`, {
           kind: 'parse-failure',
-          hint: 'Kemono ids look like service/creatorId/postId (optionally /attachmentIndex).',
+          hint: 'Pawchive ids look like service/creatorId/postId (optionally /attachmentIndex).',
         });
       }
       return {
@@ -363,16 +447,17 @@ export function createKemonoAdapter(options: KemonoOptions): BooruAdapter {
       if (failure) throw new BooruError(failure.message, { kind: failure.kind, status: snapshot.status, hint: failure.hint ?? null });
       const parsed = readJson<unknown>(snapshot, `${displayName} posts endpoint`);
       const record = Array.isArray(parsed) ? null : asRecord(parsed);
-      const list = Array.isArray(parsed) ? parsed : record && Array.isArray(record.posts) ? record.posts : null;
-      if (!list) throw shapeError(`${displayName} posts endpoint`, 'expected `{"posts": […]}` or a post array');
+      const list = postList(parsed);
+      if (!list) throw shapeError(`${displayName} posts endpoint`, 'expected a post array or an object with `posts`, `data` or `results`');
       const page = Math.max(spec.page ?? 1, 1);
       const count = record ? (typeof record.count === 'number' ? record.count : null) : null;
-      const offset = (page - 1) * KEMONO_PAGE_SIZE;
+      const offset = (page - 1) * PAWCHIVE_PAGE_SIZE;
       return {
-        posts: list.flatMap((raw) => expandKemonoPost(raw, ctx, hosts)),
+        posts: list.flatMap((raw) => expandPawchivePost(raw, ctx, hosts)),
+        sourcePosts: list.flatMap((raw) => sourcePostRef(raw, ctx)),
         page,
-        limit: KEMONO_PAGE_SIZE,
-        hasMore: count !== null ? offset + list.length < count : list.length >= KEMONO_PAGE_SIZE,
+        limit: PAWCHIVE_PAGE_SIZE,
+        hasMore: count !== null ? offset + list.length < count : list.length >= PAWCHIVE_PAGE_SIZE,
         totalCount: count,
         appliedTags: (spec.tags ?? '').trim(),
         requestUrl: snapshot.redactedUrl,
@@ -384,7 +469,7 @@ export function createKemonoAdapter(options: KemonoOptions): BooruAdapter {
     parsePostResponse(snapshot, postId, ctx): BooruPost {
       const failure = classifyFailure(snapshot, displayName);
       if (failure) throw new BooruError(failure.message, { kind: failure.kind, status: snapshot.status, hint: failure.hint ?? null });
-      const ref = parseKemonoPostId(postId);
+      const ref = parsePawchivePostId(postId);
       const parsed = readJson<unknown>(snapshot, `${displayName} post ${postId}`);
       const record = asRecord(parsed);
       // New API: `{post: {...}, attachments: [...], previews: [...]}`; old API: the post itself.
@@ -401,11 +486,19 @@ export function createKemonoAdapter(options: KemonoOptions): BooruAdapter {
           hint: files.length ? `The post has ${files.length} file(s).` : 'The post has no downloadable attachments.',
         });
       }
-      return buildPost(post, file, index, ctx, hosts);
+      const normalized = buildPost(post, file, index, ctx, hosts);
+      if (!normalized) {
+        throw new BooruError(`Pawchive file #${index} is not available yet`, {
+          kind: 'parse-failure',
+          status: snapshot.status,
+          hint: 'This file is deferred, has no usable temporary link or has not been imported. Try again later.',
+        });
+      }
+      return normalized;
     },
 
     normalizePost(raw, ctx): BooruPost {
-      const first = expandKemonoPost(raw, ctx, hosts)[0];
+      const first = expandPawchivePost(raw, ctx, hosts)[0];
       if (!first) throw shapeError(`${displayName} post`, 'post has no files');
       return first;
     },
@@ -433,58 +526,31 @@ export function createKemonoAdapter(options: KemonoOptions): BooruAdapter {
           required: false,
           requiredForAuth: false,
           secret: false,
-          placeholder: `BooruServerManager/${KEMONO_VERSION}`,
+          placeholder: PAWCHIVE_USER_AGENT,
           help: `${displayName} needs no login. Nothing else to configure.`,
         },
       ];
     },
 
     suggestUserAgent(): string {
-      return `BooruServerManager/${KEMONO_VERSION}`;
+      return PAWCHIVE_USER_AGENT;
     },
   };
 
   return adapter;
 }
 
-export const kemonoAdapter: BooruAdapter = createKemonoAdapter({
-  siteType: 'kemono',
-  displayName: 'Kemono',
-  baseUrl: 'https://kemono.cr',
-  label: 'Kemono',
-  hostPatterns: ['kemono.cr', 'www.kemono.cr', 'kemono.su', 'www.kemono.su', 'kemono.party', 'www.kemono.party'],
-  notes: ['kemono.su / kemono.party are older domains of the same site.'],
-});
-
-export const coomerAdapter: BooruAdapter = createKemonoAdapter({
-  siteType: 'coomer',
-  displayName: 'Coomer',
-  baseUrl: 'https://coomer.st',
-  label: 'Coomer',
-  hostPatterns: ['coomer.st', 'www.coomer.st', 'coomer.su', 'www.coomer.su', 'coomer.party', 'www.coomer.party'],
-  notes: ['coomer.su / coomer.party are older domains of the same site.'],
-});
-
-/**
- * Pawchive - the community's Kemono successor (launched 2026, moved from
- * pawchive.st to pawchive.pw). Same API; files are served per storage node
- * (`n<node>.pawchive.pw`) and thumbnails from `img.pawchive.pw`.
- */
-export const pawchiveAdapter: BooruAdapter = createKemonoAdapter({
+export const pawchiveAdapter: BooruAdapter = createPawchiveAdapter({
   siteType: 'pawchive',
   displayName: 'Pawchive',
   baseUrl: 'https://pawchive.pw',
   label: 'Pawchive',
   hostPatterns: ['pawchive.pw', 'www.pawchive.pw', 'pawchive.st', 'www.pawchive.st'],
-  fileHost: (baseUrl, node) => {
-    const host = new URL(baseUrl).host.replace(/^www\./, '');
-    return `https://n${node ?? 1}.${host}`;
-  },
-  thumbnailHost: (baseUrl) => `https://img.${new URL(baseUrl).host.replace(/^www\./, '')}`,
+  fileHost: DEFAULT_HOSTS.fileHost,
+  thumbnailHost: DEFAULT_HOSTS.thumbnailHost,
   notes: [
-    'Kemono-compatible API; pawchive.st is the previous domain of the same site.',
-    'Some files are marked preview-only or need a logged-in session on the website; those rows may download a preview rendition or fail with 403.',
+    'pawchive.st is the previous domain of the same site.',
+    'Signed originals are used when available; preview-only thumbnails are display-only and deferred files are skipped.',
+    'Some files need a logged-in website session and may be inaccessible to the extension.',
   ],
 });
-
-export const KEMONO_ADAPTERS: BooruAdapter[] = [kemonoAdapter, coomerAdapter, pawchiveAdapter];

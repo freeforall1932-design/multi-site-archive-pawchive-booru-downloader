@@ -35,7 +35,7 @@ export function renderQueue(container: HTMLElement, state: QueueState, callbacks
         h('h1', { text: 'Queue' }),
         h('p', {
           class: 'muted',
-          text: `${summary.total} item(s) · ${summary.pending} pending · ${summary.running} running · ${state.maxConcurrency} parallel slot(s)`,
+          text: `${summary.total} item(s) · ${summary.pending} pending · ${summary.running} downloading · ${state.maxConcurrency} start worker(s)`,
         }),
       ),
       h(
@@ -43,10 +43,10 @@ export function renderQueue(container: HTMLElement, state: QueueState, callbacks
         { class: 'header-actions' },
         summary.paused
           ? button('Resume', { variant: 'primary', iconName: 'play', onClick: () => callbacks.onResume() })
-          : button(summary.running ? 'Running…' : 'Start', { variant: 'primary', iconName: 'play', disabled: summary.running > 0 || summary.pending === 0, onClick: () => callbacks.onRun() }),
+          : button(summary.active ? 'Starting…' : 'Start', { variant: 'primary', iconName: 'play', disabled: summary.active || summary.pending === 0, onClick: () => callbacks.onRun() }),
         button('Pause', { iconName: 'pause', disabled: summary.paused, onClick: () => callbacks.onPause() }),
-        button('Retry failed', { iconName: 'refresh', disabled: summary.failed + summary.skipped === 0, onClick: () => callbacks.onRetryFailed() }),
-        button('Clear done', { variant: 'ghost', onClick: () => callbacks.onClear('completed') }),
+        button('Retry failed / unverified', { iconName: 'refresh', disabled: summary.failed + summary.skipped + summary.unverified === 0, onClick: () => callbacks.onRetryFailed() }),
+        button('Clear completed', { variant: 'ghost', onClick: () => callbacks.onClear('completed') }),
         button('Clear all', { variant: 'danger', onClick: () => callbacks.onClear('all') }),
       ),
     ),
@@ -59,6 +59,8 @@ export function renderQueue(container: HTMLElement, state: QueueState, callbacks
       h('div', { class: 'progress-fill', style: `width: ${summary.total ? Math.round((summary.done / summary.total) * 100) : 0}%` }),
     ),
   );
+
+  container.appendChild(h('p', { class: 'muted small', text: 'Completed means Chrome reported the transfer complete; file contents are not verified. Older starts are unverified.' }));
 
   if (!state.items.length) {
     container.appendChild(
@@ -101,10 +103,10 @@ export function renderQueue(container: HTMLElement, state: QueueState, callbacks
           'td',
           {},
           h('strong', { text: `#${item.postId}` }),
-          item.postUrl ? h('a', { class: 'link small', href: item.postUrl, target: '_blank', rel: 'noreferrer', text: 'open' }) : null,
+          item.postUrl && (item.kind === 'link' || (server && server.siteType !== 'hydrus')) ? h('a', { class: 'link small', href: item.postUrl, target: '_blank', rel: 'noreferrer', text: 'open' }) : null,
         ),
         h('td', { text: server?.label ?? item.serverId }),
-        h('td', {}, h('span', { class: `chip chip-status chip-${item.status}`, text: item.status }), item.attempts > 1 ? h('span', { class: 'muted small', text: ` try ${item.attempts}` }) : null),
+        h('td', {}, h('span', { class: `chip chip-status chip-${item.status}`, text: item.cancelRequested && item.status === 'running' ? 'canceling' : item.status === 'done' ? 'completed' : item.status }), item.attempts > 1 ? h('span', { class: 'muted small', text: ` try ${item.attempts}` }) : null),
         h('td', { class: 'mono small truncate', text: item.filename ?? '—' }),
         h(
           'td',

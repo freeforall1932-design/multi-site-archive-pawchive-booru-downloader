@@ -1,5 +1,6 @@
 import type { ExtensionSettings, ServerConfig } from '../shared/types.js';
 import { effectiveUserAgent, getAdapter } from './registry.js';
+import { isUsableServer } from './servers.js';
 import { hostOf } from '../shared/util.js';
 
 export interface UserAgentSyncResult {
@@ -23,7 +24,7 @@ export function buildUserAgentRules(servers: ServerConfig[], settings: Extension
   const seen = new Set<string>();
   servers.forEach((server, index) => {
     const adapter = getAdapter(server.siteType);
-    if (!adapter) return;
+    if (!adapter || !isUsableServer(server)) return;
     const host = hostOf(server.baseUrl);
     if (!host || seen.has(host)) return;
     const userAgent = effectiveUserAgent(adapter, server);

@@ -1,9 +1,9 @@
 /**
  * Adapter registration point.
  *
- * Adding a booru-like site is a single line here plus a new adapter module.
- * Nothing else in the codebase branches on site type - see
- * docs/ADAPTER_CONTRACT.md.
+ * Many booru-like sites can start with an adapter module and registration here.
+ * Site-specific permissions, UI and policy may also be needed; Pawchive already
+ * has explicit shared-service branches. See docs/ADAPTER_CONTRACT.md.
  *
  * Families shipped (mirroring what mature clients such as Droidbooru support,
  * see reference/README.md, minus dead or scrape-only sites):
@@ -15,7 +15,7 @@
  *   moebooru        yande.re, konachan
  *   philomena       derpibooru, furbooru, ponybooru
  *   hydrus          your local Hydrus client (Client API)
- *   kemono          kemono.cr, coomer.st, pawchive.pw (creator archives)
+ *   pawchive        pawchive.pw (creator archive; separate from boorus)
  */
 import { registerAdapter } from '../core/registry.js';
 import { danbooruAdapter } from './danbooru.js';
@@ -25,7 +25,7 @@ import { GELBOORU_FORK_ADAPTERS } from './gelbooru-forks.js';
 import { createMoebooruAdapter, MOEBOORU_ADAPTERS } from './moebooru.js';
 import { createPhilomenaAdapter, PHILOMENA_ADAPTERS } from './philomena.js';
 import { hydrusAdapter } from './hydrus.js';
-import { createKemonoAdapter, KEMONO_ADAPTERS } from './kemono.js';
+import { pawchiveAdapter } from './pawchive.js';
 
 let registered = false;
 
@@ -39,7 +39,7 @@ export function registerBuiltinAdapters(): void {
   for (const adapter of MOEBOORU_ADAPTERS) registerAdapter(adapter);
   for (const adapter of PHILOMENA_ADAPTERS) registerAdapter(adapter);
   registerAdapter(hydrusAdapter);
-  for (const adapter of KEMONO_ADAPTERS) registerAdapter(adapter);
+  registerAdapter(pawchiveAdapter);
   registered = true;
 }
 
@@ -66,10 +66,9 @@ export {
   createGelbooruLikeAdapter,
   createMoebooruAdapter,
   createPhilomenaAdapter,
-  createKemonoAdapter,
+  pawchiveAdapter,
   hydrusAdapter,
   GELBOORU_FORK_ADAPTERS,
   MOEBOORU_ADAPTERS,
   PHILOMENA_ADAPTERS,
-  KEMONO_ADAPTERS,
 };

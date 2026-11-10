@@ -36,7 +36,7 @@ export const TASK_FORMAT = 'booru-server-manager.task';
 export const TASK_FORMAT_VERSION = 1;
 
 export function emptyStats(): MirrorLinkStats {
-  return { total: 0, new: 0, queued: 0, done: 0, failed: 0 };
+  return { total: 0, new: 0, queued: 0, done: 0, failed: 0, unverified: 0 };
 }
 
 export interface TaskIdentity {
@@ -99,13 +99,14 @@ export function parseCreatorQuery(query: string): { service: string | null; crea
 export function taskStatsFor(task: DownloadTask, links: readonly MirrorLink[]): TaskStats {
   const wanted = new Set(task.memberIds);
   const mine = links.filter((link) => wanted.has(link.id));
-  const stats: TaskStats = { total: mine.length, done: 0, failed: 0, queued: 0, pending: 0, bytes: null };
+  const stats: TaskStats = { total: mine.length, done: 0, failed: 0, queued: 0, unverified: 0, pending: 0, bytes: null };
   let bytes = 0;
   let sized = false;
   for (const link of mine) {
     if (link.status === 'done') stats.done += 1;
     else if (link.status === 'failed') stats.failed += 1;
     else if (link.status === 'queued') stats.queued += 1;
+    else if (link.status === 'unverified') stats.unverified += 1;
     if (link.status !== 'done') stats.pending += 1;
     if (link.status === 'done' && typeof link.bytes === 'number') {
       bytes += link.bytes;
@@ -137,7 +138,8 @@ export function statsLabel(stats: TaskStats): string {
   if (stats.total === 0) return 'no files yet';
   const parts = [`${stats.done} / ${stats.total} done`];
   if (stats.failed) parts.push(`${stats.failed} failed`);
-  const fresh = stats.total - stats.done - stats.failed - stats.queued;
+  if (stats.unverified) parts.push(`${stats.unverified} unverified`);
+  const fresh = stats.total - stats.done - stats.failed - stats.queued - stats.unverified;
   if (fresh > 0) parts.push(`${fresh} not downloaded`);
   if (stats.queued) parts.push(`${stats.queued} in the queue`);
   return parts.join(' · ');
@@ -181,7 +183,7 @@ export function planTaskRun(task: DownloadTask, links: readonly MirrorLink[], mo
       plan.alreadyDone += 1;
       continue;
     }
-    if (link.status === 'failed') plan.retrying += 1;
+    if (link.status === 'failed' || link.status === 'unverified') plan.retrying += 1;
     plan.ids.push(link.id);
   }
   return plan;
@@ -199,6 +201,7 @@ export function startRun(input: { scannedPosts?: number; added?: number; queued?
     done: 0,
     failed: 0,
     note: input.note ?? null,
+    completionTracking: 'browser-complete',
   };
 }
 
@@ -437,6 +440,7 @@ export function parseTaskPackage(text: string): ParsedTaskPackage {
               done: asNumber(run.done) ?? 0,
               failed: asNumber(run.failed) ?? 0,
               note: asString(run.note),
+              completionTracking: run.completionTracking === 'browser-complete' ? 'browser-complete' as const : undefined,
             }))
           : [],
       },

@@ -3,7 +3,7 @@
  * collected links is exported to / imported from a plain `.txt` file.
  *
  * This is the extension's answer to a userscript such as *Pawchive Link
- * Collector*: creator archives (Kemono, Coomer, Pawchive) put their real
+ * Collector*: Pawchive posts can link
  * downloads on Google Drive, Mega, MediaFire and friends, addressable only as
  * URLs inside the post body. Those URLs are not booru posts, so nothing in the
  * adapter contract can describe them - but they are still work the queue can do.
@@ -20,6 +20,7 @@
  * Links on the site's own host are always skipped - the extension already
  * downloads those as attachment rows.
  */
+import { isPawchiveHost } from '../adapters/pawchive.js';
 import type { MirrorLink, MirrorLinkFilter, MirrorLinkSection, ServerConfig } from '../shared/types.js';
 import { isRecord, safeUrl, uniqueBy } from '../shared/util.js';
 
@@ -28,6 +29,7 @@ export const MIRROR_PROVIDERS: ReadonlyArray<{ host: string; label: string }> = 
   { host: 'drive.google.com', label: 'Google Drive' },
   { host: 'docs.google.com', label: 'Google Docs' },
   { host: 'mega.nz', label: 'Mega' },
+  { host: 'mega.co.nz', label: 'Mega' },
   { host: 'drive.proton.me', label: 'Proton Drive' },
   { host: 'mediafire.com', label: 'MediaFire' },
   { host: 'dropbox.com', label: 'Dropbox' },
@@ -104,19 +106,62 @@ export function normalizeLinkUrl(raw: string, baseUrl?: string | null): string |
     const url = new URL(cleaned, baseUrl ?? undefined);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
     if (!url.hostname) return null;
-    // Fragments are navigation, not file identity; the query often is (id=…).
-    url.hash = '';
+    // Fragments can carry decryption keys (Mega, Proton and others). They are
+    // part of the share link even though browsers do not send them in HTTP.
     return url.toString();
   } catch {
     return null;
   }
 }
 
+/** Match both modern and historical Mega share-link hosts. */
+function isMegaHost(host: string): boolean {
+  const name = host.toLowerCase();
+  return name === 'mega.nz' || name.endsWith('.mega.nz') || name === 'mega.co.nz' || name.endsWith('.mega.co.nz');
+}
+
+/**
+ * Only a modern, single-file/folder Mega URL has an unambiguous old keyless
+ * identity. Old `/#...` shares lost the ID as well as the key, and folder
+ * sub-selections may have collapsed together, so neither can be auto-matched.
+ */
+export function legacyMegaKeylessUrl(raw: string): string | null {
+  const url = safeUrl(raw);
+  if (!url || !isMegaHost(url.hostname) || !url.hash || url.hash.includes('/')) return null;
+  if (!/^\/(?:file|folder)\/[^/]+\/?$/i.test(url.pathname)) return null;
+  url.hash = '';
+  return url.toString();
+}
+
+/**
+ * Known share pages do not return raw files through a plain browser download.
+ * Keep them for opening/exporting, but don't save HTML as a successful file.
+ * Other hosts may also show interstitials, which cannot be detected here.
+ */
+export function manualMirrorProvider(raw: string): string | null {
+  const url = safeUrl(raw);
+  if (!url) return null;
+  const host = url.hostname.toLowerCase();
+  const path = url.pathname.toLowerCase();
+  if (isMegaHost(host)) return 'Mega';
+  if (host === 'drive.google.com' || host === 'docs.google.com') return 'Google Drive';
+  if (host === 'drive.proton.me' || host === 'protondrive.com') return 'Proton Drive';
+  if ((host === 'mediafire.com' || host === 'www.mediafire.com') && /^\/(?:file|folder)\//.test(path)) return 'MediaFire';
+  if ((host === 'gofile.io' || host === 'www.gofile.io') && /^\/(?:d|folder)\//.test(path)) return 'GoFile';
+  if ((host === 'pixeldrain.com' || host === 'www.pixeldrain.com') && /^\/(?:u|l)\//.test(path)) return 'Pixeldrain';
+  if ((host === 'dropbox.com' || host === 'www.dropbox.com') && /^\/(?:s|scl|sh)\//.test(path)) return 'Dropbox';
+  return null;
+}
+
 /** Hosts that belong to the profile itself (site host plus its subdomains). */
 export function ownHostsOf(server: Pick<ServerConfig, 'baseUrl'> | null | undefined): string[] {
   if (!server) return [];
   const url = safeUrl(server.baseUrl);
-  return url ? [url.hostname.toLowerCase()] : [];
+  if (!url) return [];
+  // Both official domains and their CDNs are Pawchive's own storage, even
+  // when a post mentions the other domain from the selected profile.
+  if (isPawchiveHost(url.hostname, true)) return ['pawchive.pw', 'pawchive.st'];
+  return [url.hostname.toLowerCase()];
 }
 
 export function isOwnHost(host: string, ownHosts: readonly string[]): boolean {
@@ -225,7 +270,7 @@ export function extractUrlsFromText(text: string): string[] {
  * Walk an API payload and collect every URL in it.
  *
  * Site-agnostic on purpose: the adapter contract stays untouched, and the same
- * scan works for a Kemono `content` field, an e621 `source`, or any field a fork
+ * scan works for a Pawchive `content` field, an e621 `source`, or any field a fork
  * adds later. Deep payloads are bounded so a pathological response cannot hang
  * the worker.
  */

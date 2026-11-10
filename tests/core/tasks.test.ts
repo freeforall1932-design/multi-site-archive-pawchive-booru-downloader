@@ -285,7 +285,7 @@ describe('task store + router flow', () => {
     expect(view.task.lastScanAt).toBeTruthy();
   });
 
-  it('downloads only what is missing, then reports complete', async () => {
+  it('starts direct files and reports share pages as requiring manual download', async () => {
     const view = await collect();
     const first = await ok<{ queued: number; started: boolean; plan: { alreadyDone: number; retrying: number } }>(harness, {
       type: 'tasks/run',
@@ -297,48 +297,51 @@ describe('task store + router flow', () => {
     await harness.queue.run();
 
     const after = await ok<{ tasks: TaskView[] }>(harness, { type: 'tasks/list' });
-    expect(after.tasks[0]?.stats.done).toBe(6);
-    expect(after.tasks[0]?.completion).toBe('complete');
+    expect(after.tasks[0]?.stats.done).toBe(1);
+    expect(after.tasks[0]?.stats.failed).toBe(5);
+    expect(after.tasks[0]?.completion).toBe('partial');
     expect(after.tasks[0]?.lastRun?.finishedAt).toBeTruthy();
-    expect(after.tasks[0]?.lastRun?.done).toBe(6);
+    expect(after.tasks[0]?.lastRun?.done).toBe(1);
 
-    // Nothing left to do: the button would be disabled and the plan is empty.
+    // The direct link is skipped; share pages remain available for manual use.
     const again = await ok<{ queued: number; plan: { alreadyDone: number } }>(harness, {
       type: 'tasks/run',
       payload: { taskId: view.task.id, start: false },
     });
-    expect(again.queued).toBe(0);
-    expect(again.plan.alreadyDone).toBe(6);
+    expect(again.queued).toBe(5);
+    expect(again.plan.alreadyDone).toBe(1);
   });
 
   it('retries only the failures on the next run', async () => {
     const view = await collect();
-    // One mirror refuses; the other five come in.
-    const target = (await harness.links.list())[0]!;
+    // The one direct mirror refuses; the five share pages already need a provider.
+    const target = (await harness.links.list()).find((link) => link.host === 'catbox.moe')!;
     harness.downloader.failUrls.add(target.url);
     await ok(harness, { type: 'tasks/run', payload: { taskId: view.task.id, start: false } });
     await harness.queue.run();
 
     const afterFirst = await ok<{ tasks: TaskView[] }>(harness, { type: 'tasks/list' });
     const broken = afterFirst.tasks[0]!;
-    expect(broken.stats.failed).toBe(1);
-    expect(broken.completion).toBe('partial');
-    expect(broken.lastRun?.failed).toBe(1);
+    expect(broken.stats.failed).toBe(6);
+    expect(broken.completion).toBe('failed');
+    expect(broken.lastRun?.failed).toBe(6);
 
-    // The next run queues exactly the failure.
+    // The next run retries the direct failure and the unresolved share pages.
     const retry = await ok<{ queued: number; plan: { retrying: number; alreadyDone: number } }>(harness, {
       type: 'tasks/run',
       payload: { taskId: view.task.id, start: false },
     });
-    expect(retry.plan.retrying).toBe(1);
-    expect(retry.queued).toBe(1);
-    expect(retry.plan.alreadyDone).toBe(5);
+    expect(retry.plan.retrying).toBe(6);
+    expect(retry.queued).toBe(6);
+    expect(retry.plan.alreadyDone).toBe(0);
 
-    // And the retry succeeds once the mirror behaves.
+    // Only the direct file starts once the mirror behaves; share pages remain manual.
     harness.downloader.failUrls.clear();
     await harness.queue.run();
     const healed = await ok<{ tasks: TaskView[] }>(harness, { type: 'tasks/list' });
-    expect(healed.tasks[0]?.completion).toBe('complete');
+    expect(healed.tasks[0]?.completion).toBe('partial');
+    expect(healed.tasks[0]?.stats.done).toBe(1);
+    expect(healed.tasks[0]?.stats.failed).toBe(5);
   });
 
   it('pauses a task by dropping what is still waiting', async () => {
@@ -381,23 +384,26 @@ describe('task store + router flow', () => {
     expect(imported.task.stats.pending).toBe(6);
     expect(imported.task.completion).toBe('idle');
 
-    // It downloads with no server configured on this side at all. (`start: false`
+    // It queues with no server configured on this side at all. (`start: false`
     // only keeps the test deterministic - the default is the user's
     // "Start downloading immediately" setting.)
     const run = await ok<{ queued: number }>(friend, { type: 'tasks/run', payload: { taskId: view.task.id, start: false } });
     expect(run.queued).toBe(6);
     await friend.queue.run();
     const done = await ok<{ tasks: TaskView[] }>(friend, { type: 'tasks/list' });
-    expect(done.tasks[0]?.completion).toBe('complete');
+    expect(done.tasks[0]?.completion).toBe('partial');
+    expect(done.tasks[0]?.stats.done).toBe(1);
+    expect(done.tasks[0]?.stats.failed).toBe(5);
 
-    // And importing the *same* package again knows everything is already there.
+    // Importing the same package preserves the outcomes without duplicating links.
     const repeat = await ok<{ created: boolean; added: number; updated: number; task: TaskView }>(friend, {
       type: 'tasks/import',
       payload: { text: manifest.text, filename: manifest.filename },
     });
     expect(repeat.created).toBe(false);
     expect(repeat.added).toBe(0);
-    expect(repeat.task.stats.done).toBe(6);
+    expect(repeat.task.stats.done).toBe(1);
+    expect(repeat.task.stats.failed).toBe(5);
   });
 
   it('imports the plain text half too, naming the task from the creator header', async () => {

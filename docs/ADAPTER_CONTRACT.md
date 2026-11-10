@@ -2,15 +2,15 @@
 
 Every supported site is one implementation of `BooruAdapter`
 (`src/core/adapter.ts`). The rest of the extension — UI, server manager,
-validation, queue, naming, downloads — is site-agnostic: it asks the registry for
-an adapter by `siteType` and only ever calls contract methods.
+validation, queue, naming and downloads — uses the registry for common site API
+mappings. The shared layer is not completely site-agnostic: Pawchive has explicit
+attachment, pacing and task policies, and new sites may need manifest permissions
+or dedicated behavior.
 
-Consequences of that rule:
-
-- Adding a booru-like site = **one new file + one registration line**.
-- No `if (site === 'e621')` outside `src/adapters/`.
-- A new adapter must pass `tests/adapters/contract.test.ts`, which is
-  automatically parametrised over every registered adapter.
+A new adapter starts with an implementation and registration, must pass
+`tests/adapters/contract.test.ts`, and needs site-specific fixtures, permission
+review and original-only download tests. The snippets below are illustrative,
+not a copy-paste-complete adapter.
 
 ---
 
@@ -31,7 +31,7 @@ interface AdapterCapabilities {     // what the site can do — drives the UI
   requiresUserId: boolean;
   requiresApiKey: boolean;
   requiresUserAgent: boolean;
-  authStyle: 'basic' | 'query' | 'basic-or-query' | 'query-with-userid';
+  authStyle: 'basic' | 'query' | 'basic-or-query' | 'query-with-userid' | 'header';
   supportsBasicAuthHeader: boolean;
   maxPostsPerRequest: number;       // e621 320, Danbooru 200, Gelbooru 100
   maxPage: number | null;           // e621 listing stops at page 750
@@ -56,7 +56,7 @@ interface CredentialField {
   type: 'text' | 'password' | 'textarea';
   required: boolean;                // profile is unusable without it
   requiredForAuth: boolean;         // needed only when signing in
-  secret: boolean;                  // never rendered/logged in the clear
+  secret: boolean;                  // profile field should be masked; audit all generated URLs too
   placeholder?: string;
   help?: string;
 }
@@ -102,7 +102,7 @@ interface BooruAdapter {
 
 | Invariant | Why |
 | --- | --- |
-| `capabilities.authStyle` is one of the four documented values | The server form and diagnostics render it verbatim |
+| `capabilities.authStyle` is one of the five documented values | The server form and diagnostics render it verbatim |
 | `credentialFields().key` ⊆ `{username, apiKey, userId, customUserAgent}` | The profile schema is fixed by product policy |
 | At least one probe has `purpose: 'endpoint'` | Endpoint mismatch must be diagnosable before credentials |
 | Every auth probe is `enabled: false` when no credentials are saved | Anonymous read-only validation must work |
@@ -111,9 +111,12 @@ interface BooruAdapter {
 | `ratingQueryTags([])` excludes every canonical rating | Empty allow-list must never mean “everything” |
 | `suggestUserAgent()` output is never browser-like (`Mozilla/…`) | Site policies forbid impersonating a browser |
 | `matchRoute()` is pure and returns `null` for foreign URLs | The popup asks before any server is saved |
-| Register/unregister of an adapter needs no shared-code change | The whole point of the contract |
+| Adapter registration exposes it to the common contract | Additional permissions or site-specific policies may still require shared changes |
 
 ## 3. Writing an adapter
+
+This is a sketch: implement the omitted parsing and interpretation methods,
+handle malformed/foreign URLs, and review permissions before registering it.
 
 ```ts
 // src/adapters/example.ts
@@ -130,7 +133,7 @@ export const exampleAdapter: BooruAdapter = {
     requiresUserId: false,
     requiresApiKey: true,
     requiresUserAgent: true,
-    authStyle: 'query',
+    authStyle: 'header',
     supportsBasicAuthHeader: false,
     maxPostsPerRequest: 100,
     maxPage: null,
@@ -146,7 +149,7 @@ export const exampleAdapter: BooruAdapter = {
     baseUrl: 'https://example.invalid',
     label: 'Example Booru',
     ratings: ['safe', 'general'],
-    userAgentHint: 'BooruServerManager/0.1.0 (by example_user on example.invalid)',
+    userAgentHint: 'BooruServerManager/0.2.0 (by example_user on example.invalid)',
   },
 
   matchesHost(host) {
@@ -168,8 +171,11 @@ export const exampleAdapter: BooruAdapter = {
     const params = new URLSearchParams({ limit: String(Math.min(spec.limit ?? 50, 100)) });
     const filter = spec.ratingFilter?.enabled ? ratingExclusions(this, spec.ratingFilter.allowed) : { tags: [], warnings: [] };
     params.set('tags', composeTags(spec.tags, filter.tags, ctx.settings.globalTagSuffix));
-    if (ctx.server.apiKey) params.set('api_key', ctx.server.apiKey);
-    return { url: `${ctx.baseUrl}/api/posts?${params}`, tag: 'example', label: 'Listing' };
+    return {
+      url: `${ctx.baseUrl}/api/posts?${params}`,
+      headers: ctx.server.apiKey ? { 'X-API-Key': ctx.server.apiKey } : {},
+      redirect: 'error', tag: 'example', label: 'Listing',
+    };
   },
 
   buildPostRequest(ctx, postId) {
@@ -195,7 +201,7 @@ export const exampleAdapter: BooruAdapter = {
         label: 'Authenticated request',
         purpose: 'auth',
         enabled: hasCredentials,
-        request: { url: `${ctx.baseUrl}/api/profile?api_key=${encodeURIComponent(ctx.server.apiKey)}`, tag: 'example', label: 'Credential check' },
+        request: { url: `${ctx.baseUrl}/api/profile`, headers: { 'X-API-Key': ctx.server.apiKey }, redirect: 'error', tag: 'example', label: 'Credential check' },
         interpret: (snapshot) => { /* map 401 / 403 / payload → ProbeInterpretation */ },
       },
     ];
@@ -214,21 +220,15 @@ export const exampleAdapter: BooruAdapter = {
   },
 
   suggestUserAgent(ctx) {
-    return `BooruServerManager/0.1.0 (by ${ctx.server.username || 'anonymous'} on example.invalid)`;
+    return `BooruServerManager/0.2.0 (by ${ctx.server.username || 'anonymous'} on example.invalid)`;
   },
 };
 ```
 
-Then register it — the only change outside the new file:
-
-```ts
-// src/adapters/index.ts
-export function registerBuiltinAdapters(): void {
-  for (const adapter of [e621Adapter, danbooruAdapter, gelbooruAdapter, exampleAdapter]) {
-    if (!getAdapter(adapter.siteType)) registerAdapter(adapter);
-  }
-}
-```
+Then import it and add `registerAdapter(exampleAdapter)` to
+`registerBuiltinAdapters()` in `src/adapters/index.ts`; do not replace the
+existing registration list. Review `src/manifest.json` and any required
+site-specific policies or UI behavior as well.
 
 Run `npm test` — the conformance suite picks the new adapter up automatically, and
 the server editor renders its credential fields with no UI change.
@@ -328,6 +328,11 @@ error detection.
 - [ ] `normalizePost` fills **every** `BooruPost` field, using the canonical rating.
 - [ ] At least one endpoint probe and one auth probe, with `enabled` flags.
 - [ ] `credentialFields` marks secrets and explains what is required when.
+- [ ] No credential is embedded in post, file or thumbnail URLs exposed to UI,
+      queue/history or Chrome Downloads; review redirects, header persistence and
+      errors too. Hydrus now uses headers and key-free URLs, but Chrome Downloads
+      header/redirect behavior and real-client compatibility still need testing.
+- [ ] Downloads select only the original and reject known reduced renditions.
 - [ ] `suggestUserAgent` never returns a browser-looking string.
 - [ ] Tests: response fixtures for happy path, empty result, HTML body, 401, 429,
       malformed JSON, plus the conformance suite.

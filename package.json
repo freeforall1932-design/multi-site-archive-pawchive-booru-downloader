@@ -2,10 +2,10 @@
   "name": "booru-server-manager",
   "version": "0.2.0",
   "private": true,
-  "description": "One browser extension, many saved booru servers: a side-panel server manager + downloader for e621, Danbooru and Gelbooru family sites.",
+  "description": "A side-panel downloader for Pawchive and multiple booru and Hydrus server profiles.",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": "^20.0.0 || ^22.0.0 || >=24.0.0"
   },
   "scripts": {
     "build": "node scripts/build.mjs",
@@ -21,6 +21,7 @@
     "@types/chrome": "^0.0.287",
     "@types/node": "^22.10.2",
     "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "vite": "^6.4.5",
+    "vitest": "^4.1.12"
   }
 }

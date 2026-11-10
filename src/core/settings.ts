@@ -34,7 +34,9 @@ export function normalizeSettings(raw: unknown): ExtensionSettings {
     showThumbnails: input.showThumbnails ?? DEFAULT_SETTINGS.showThumbnails,
     autoStartQueue: input.autoStartQueue ?? DEFAULT_SETTINGS.autoStartQueue,
     duplicateBehaviour: input.duplicateBehaviour === 'overwrite' ? 'overwrite' : 'uniquify',
-    filePreference: input.filePreference === 'sample' ? 'sample' : 'original',
+    // Legacy profiles may contain `sample`; silently migrate them to the only
+    // supported download quality. UI thumbnails are unaffected.
+    filePreference: 'original',
     tagBlacklist: sanitizeTagList(input.tagBlacklist, 500),
     searchHistoryEnabled: input.searchHistoryEnabled ?? DEFAULT_SETTINGS.searchHistoryEnabled,
     searchHistoryLimit: clamp(toInt(input.searchHistoryLimit, DEFAULT_SETTINGS.searchHistoryLimit), 0, 50),
@@ -93,9 +95,16 @@ function sanitizeTemplate(value: unknown, fallback: string): string {
 
 export class SettingsStore {
   private cache: ExtensionSettings | null = null;
+  private chain: Promise<unknown> = Promise.resolve();
   private readonly listeners = new Set<SettingsListener>();
 
   constructor(private readonly area: StorageArea) {}
+
+  private serialize<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.chain.then(task, task);
+    this.chain = next.then(() => undefined, () => undefined);
+    return next;
+  }
 
   async get(): Promise<ExtensionSettings> {
     if (this.cache) return { ...this.cache };
@@ -105,12 +114,14 @@ export class SettingsStore {
   }
 
   async save(patch: Partial<ExtensionSettings>): Promise<ExtensionSettings> {
-    const current = await this.get();
-    const next = normalizeSettings({ ...current, ...patch });
-    this.cache = next;
-    await this.area.set(STORAGE_KEYS.settings, next);
-    this.listeners.forEach((listener) => listener({ ...next }));
-    return { ...next };
+    return this.serialize(async () => {
+      const current = await this.get();
+      const next = normalizeSettings({ ...current, ...patch });
+      await this.area.set(STORAGE_KEYS.settings, next);
+      this.cache = next;
+      this.listeners.forEach((listener) => listener({ ...next }));
+      return { ...next };
+    });
   }
 
   async reset(): Promise<ExtensionSettings> {

@@ -12,7 +12,7 @@
  */
 import { registerBuiltinAdapters } from '../adapters/index.js';
 import { BooruClient } from '../core/client.js';
-import type { UiRequest } from '../core/messages.js';
+import type { RouterResponse, UiRequest } from '../core/messages.js';
 import { DownloadHistoryStore, SearchHistoryStore } from '../core/history.js';
 import { MirrorLinkStore } from '../core/link-store.js';
 import { TaskStore } from '../core/task-store.js';
@@ -23,10 +23,10 @@ import { SettingsStore } from '../core/settings.js';
 import { STORAGE_KEYS, WebStorageArea, type StorageArea } from '../core/storage.js';
 import { ValidationService } from '../core/validation.js';
 import { HttpClient } from '../shared/http.js';
-import type { ServerConfig } from '../shared/types.js';
+import type { BooruPost, SearchResult, ServerConfig } from '../shared/types.js';
 import { createServerConfig } from '../core/servers.js';
 import { installPlatform } from '../platform/index.js';
-import { PREVIEW_STORAGE_NAMESPACE, PreviewDownloader, PreviewPlatform } from '../platform/preview.js';
+import { PREVIEW_STORAGE_NAMESPACE, PreviewDownloader, PreviewPlatform, previewMediaUrl } from '../platform/preview.js';
 import { createMockBooruFetch } from './mock-booru.js';
 import { MOCK_CREDENTIALS } from './mock-data.js';
 
@@ -38,6 +38,22 @@ interface PreviewGlobal {
 }
 
 const globalScope = globalThis as typeof globalThis & { __bsmPreview?: PreviewGlobal };
+
+/** Keep automatic thumbnails inside the preview, even for real-shaped mock URLs. */
+export function withPreviewMedia(request: UiRequest, response: RouterResponse): RouterResponse {
+  if (!response.ok) return response;
+  const post = (entry: BooruPost): BooruPost => ({ ...entry, previewUrl: previewMediaUrl(entry.previewUrl || entry.id) });
+  if (request.type === 'browse/search') {
+    const data = response.data as SearchResult;
+    return { ...response, data: { ...data, posts: data.posts.map(post) } };
+  }
+  if (request.type === 'posts/get') return { ...response, data: post(response.data as BooruPost) };
+  if (request.type === 'posts/resolveUrl' || request.type === 'posts/download') {
+    const data = response.data as { post: BooruPost };
+    return { ...response, data: { ...data, post: post(data.post) } };
+  }
+  return response;
+}
 
 /** Seed profiles so the preview opens with a working server manager. */
 export function defaultPreviewServers(): ServerConfig[] {
@@ -146,7 +162,7 @@ export async function startPreview(options: { reseed?: boolean } = {}): Promise<
 
   installPlatform(
     new PreviewPlatform({
-      handler: (request: UiRequest) => router(request),
+      handler: async (request: UiRequest) => withPreviewMedia(request, await router(request)),
       downloader,
       storage,
     }),

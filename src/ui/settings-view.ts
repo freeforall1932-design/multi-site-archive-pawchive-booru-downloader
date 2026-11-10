@@ -57,6 +57,7 @@ export function renderSettings(container: HTMLElement, state: SettingsState, cal
     {
       settings: state.settings,
       saving: state.saving,
+      autoSave: false,
       hostAccess: state.hostAccess,
       servers: state.servers ?? [],
       adapters: state.adapters ?? [],

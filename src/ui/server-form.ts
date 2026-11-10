@@ -19,6 +19,38 @@ export interface ServerFormDraft {
   isDefault: boolean;
 }
 
+/** Connection fields whose validation result becomes stale when edited. */
+export function draftValidationSignature(draft: ServerFormDraft): string {
+  return JSON.stringify({
+    siteType: draft.siteType, baseUrl: draft.baseUrl, username: draft.username,
+    apiKey: draft.apiKey, userId: draft.userId, customUserAgent: draft.customUserAgent,
+  });
+}
+
+/** Keep both editors consistent about validation and the explicit offline override. */
+export function draftSaveDecision(editor: {
+  draft: ServerFormDraft;
+  isNew: boolean;
+  validation: ValidationResult | null;
+  validatedSignature: string | null;
+}, force: boolean): 'save' | 'validate' | 'blocked' {
+  if (force) return 'save';
+  const current = editor.validatedSignature === draftValidationSignature(editor.draft);
+  if (current && editor.validation && !editor.validation.ok) return 'blocked';
+  if (!editor.isNew && (!current || !editor.validation)) return 'validate';
+  return 'save';
+}
+
+/** Switching family must not silently retain the old endpoint or credentials. */
+export function withSiteDefaults(draft: ServerFormDraft, siteType: string, adapters: AdapterCatalogEntry[]): ServerFormDraft {
+  const next = adapters.find((entry) => entry.siteType === siteType);
+  return {
+    ...draft, siteType, baseUrl: next?.baseUrl ?? '', label: next?.displayName ?? siteType,
+    allowedRatings: next?.defaultRatings ?? [], ratingFilterEnabled: next?.supportsRatingFilter ?? true,
+    customUserAgent: '', username: '', userId: '', apiKey: '',
+  };
+}
+
 export interface ServerFormState {
   draft: ServerFormDraft;
   adapters: AdapterCatalogEntry[];
@@ -64,7 +96,7 @@ export function renderServerForm(container: HTMLElement, state: ServerFormState,
         'div',
         {},
         h('h1', { text: state.isNew ? 'Add server' : `Edit ${draft.label || 'server'}` }),
-        h('p', { class: 'muted', text: 'Credentials are stored locally and only sent to the configured site.' }),
+        h('p', { class: 'muted', text: 'Credentials are stored locally. Review the security notes before using sensitive keys.' }),
       ),
       h('div', { class: 'header-actions' }, button('Back to list', { iconName: 'servers', onClick: () => callbacks.onBackToList() })),
     ),
@@ -75,7 +107,7 @@ export function renderServerForm(container: HTMLElement, state: ServerFormState,
     on: {
       submit: (event) => {
         event.preventDefault();
-        callbacks.onSave({ force: state.validation?.ok === true });
+        if (!state.saving && !state.validating) callbacks.onSave({ force: state.validation?.ok === true && state.validatedCurrentValues });
       },
     },
   });
@@ -121,7 +153,7 @@ export function renderServerForm(container: HTMLElement, state: ServerFormState,
         placeholder: adapter?.baseUrl ?? 'https://example.com',
         on: { input: (event) => callbacks.onChange({ baseUrl: (event.target as HTMLInputElement).value }) },
       }),
-      { help: 'Site root, without /posts or /index.php. Self-hosted forks work too.' },
+      { help: 'Site root, without /posts or /index.php. When changing a saved target, re-enter its key or clear the old credentials first.' },
     ),
   );
 
@@ -237,8 +269,8 @@ export function renderServerForm(container: HTMLElement, state: ServerFormState,
       button(state.saving ? 'Saving…' : state.isNew ? 'Save server' : 'Save changes', {
         variant: 'primary',
         iconName: 'check',
-        disabled: state.saving,
-        onClick: () => callbacks.onSave({ force: state.validation?.ok === true }),
+        disabled: state.saving || state.validating,
+        onClick: () => callbacks.onSave({ force: state.validation?.ok === true && state.validatedCurrentValues }),
       }),
       button('Cancel', { variant: 'ghost', onClick: () => callbacks.onCancel() }),
       state.validation && !state.validation.ok
@@ -251,6 +283,13 @@ export function renderServerForm(container: HTMLElement, state: ServerFormState,
     ),
   );
 
+  // The controller intentionally ignores edits while a save is in flight.
+  // Disable those controls so typing cannot appear to succeed and then vanish.
+  if (state.saving) {
+    for (const control of form.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement>('input, select, textarea, button')) {
+      control.disabled = true;
+    }
+  }
   container.appendChild(form);
   container.appendChild(validationPanel(state));
 }

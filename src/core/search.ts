@@ -4,12 +4,12 @@
  * The panel's search box takes what the user typed; the settings add two layers
  * the sites themselves understand:
  *
- *  - **Global tag suffix** - extra tags appended to every search.
- *  - **Tag blacklist** - tags excluded from every search, spelled the portable
+ *  - **Global tag suffix** - extra tags appended to booru searches.
+ *  - **Tag blacklist** - tags excluded from booru searches, spelled the portable
  *    way (`-tag`) that e621, Danbooru and Gelbooru all accept.
  *
- * Both are applied *before* the adapter sees the query, so every surface (panel
- * listing, popup quick search, options Browse) gets identical behaviour.
+ * These rules are used across panel, popup and options booru searches; Pawchive
+ * creator/title queries use a different syntax and are passed through unchanged.
  */
 
 export interface SearchTagInput {

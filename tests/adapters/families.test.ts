@@ -7,7 +7,6 @@ import { describe, expect, it } from 'vitest';
 import { registerBuiltinAdapters } from '../../src/adapters/index.js';
 import { rule34Adapter, safebooruOrgAdapter } from '../../src/adapters/gelbooru-forks.js';
 import { composeHydrusTags, hydrusAdapter } from '../../src/adapters/hydrus.js';
-import { expandKemonoPost, kemonoAdapter, parseKemonoPostId, parseKemonoQuery } from '../../src/adapters/kemono.js';
 import { konachanAdapter, yandereAdapter } from '../../src/adapters/moebooru.js';
 import { composePhilomenaQuery, derpibooruAdapter } from '../../src/adapters/philomena.js';
 import { createAdapterContext } from '../../src/core/registry.js';
@@ -332,17 +331,25 @@ const hydrusMetadata = {
 describe('Hydrus adapter', () => {
   const ctx = ctxFor(hydrusAdapter, { apiKey: 'abc123' });
 
+  it('warns about redirect uncertainty and previously exposed keys', () => {
+    expect(hydrusAdapter.capabilities.notes.join(' ')).toMatch(/redirects.*not been verified/i);
+    expect(hydrusAdapter.capabilities.notes.join(' ')).toMatch(/older versions.*keys.*history/i);
+    expect(hydrusAdapter.credentialFields()[0]?.help).toMatch(/restricted key.*redirects/i);
+  });
+
   it('normalizes the base URL to plain http on localhost', () => {
     expect(hydrusAdapter.normalizeBaseUrl!('127.0.0.1:45869/')).toBe('http://127.0.0.1:45869');
     expect(ctx.baseUrl).toBe('http://127.0.0.1:45869');
   });
 
-  it('builds search_files with a JSON tag list and the key as a query parameter', () => {
-    const url = new URL(hydrusAdapter.buildSearchRequest(ctx, { tags: 'blue eyes, -tagme', limit: 100, page: 1 }).url);
+  it('uses an authentication header and rejects redirects for search', () => {
+    const request = hydrusAdapter.buildSearchRequest(ctx, { tags: 'blue eyes, -tagme', limit: 100, page: 1 });
+    const url = new URL(request.url);
     expect(url.pathname).toBe('/get_files/search_files');
     expect(JSON.parse(url.searchParams.get('tags')!)).toEqual(['blue eyes', '-tagme']);
-    expect(url.searchParams.get('Hydrus-Client-API-Access-Key')).toBe('abc123');
-    expect(redactUrl(url.toString())).not.toContain('abc123');
+    expect(url.toString()).not.toContain('abc123');
+    expect(request.headers?.['Hydrus-Client-API-Access-Key']).toBe('abc123');
+    expect(request.redirect).toBe('error');
     expect(composeHydrusTags('', '')).toEqual(['system:everything']);
   });
 
@@ -390,153 +397,3 @@ describe('Hydrus adapter', () => {
     expect(hydrusAdapter.ratingQueryTags(['safe']).warnings[0]).toMatch(/no rating/);
   });
 });
-
-// ---------------------------------------------------------------------------
-// Kemono
-// ---------------------------------------------------------------------------
-
-const kemonoPost = {
-  id: '147648418',
-  user: '90822862',
-  service: 'patreon',
-  title: 'Christmas Livestream',
-  substring: '',
-  published: '2026-01-07T17:20:52',
-  file: { name: '593089088.mp4', path: '/e5/01/e50103ae3e5a110a1d0c0613e1032e24d9fcddc666027bfa2dffc24a35873e3b.mp4' },
-  attachments: [
-    { name: '593089088.mp4', path: '/e5/01/e50103ae3e5a110a1d0c0613e1032e24d9fcddc666027bfa2dffc24a35873e3b.mp4' },
-    { name: 'Untitled-1.png', path: '/5e/ed/5eed06421a9ec787dce18f6dd8a839c2cd63c1891435a74374d15485814ad259.png' },
-  ],
-};
-
-describe('Kemono adapter', () => {
-  const ctx = ctxFor(kemonoAdapter);
-
-  it('parses composite ids and user queries', () => {
-    expect(parseKemonoPostId('patreon/90822862/147648418')).toEqual({ service: 'patreon', user: '90822862', post: '147648418', index: null });
-    expect(parseKemonoPostId('patreon/90822862/147648418/1')?.index).toBe(1);
-    expect(parseKemonoPostId('123')).toBeNull();
-    expect(parseKemonoQuery('patreon/90822862')).toEqual({ kind: 'creator', service: 'patreon', user: '90822862' });
-    expect(parseKemonoQuery('https://kemono.cr/fanbox/user/123?o=50')).toEqual({ kind: 'creator', service: 'fanbox', user: '123' });
-    expect(parseKemonoQuery('tag:furry')).toEqual({ kind: 'tag', tag: 'furry' });
-    expect(parseKemonoQuery('christmas stream')).toEqual({ kind: 'text', q: 'christmas stream' });
-  });
-
-  it('builds site-wide, tag and creator listing requests with 50-post offsets', () => {
-    expect(new URL(kemonoAdapter.buildSearchRequest(ctx, { tags: 'stream', page: 3 }).url).toString()).toBe('https://kemono.cr/api/v1/posts?q=stream&o=100');
-    expect(new URL(kemonoAdapter.buildSearchRequest(ctx, { tags: 'tag:furry', page: 1 }).url).searchParams.get('tag')).toBe('furry');
-    expect(kemonoAdapter.buildSearchRequest(ctx, { tags: 'patreon/90822862', page: 2 }).url).toBe('https://kemono.cr/api/v1/patreon/user/90822862/posts?o=50');
-  });
-
-  it('expands one post into one row per unique file', () => {
-    const rows = expandKemonoPost(kemonoPost, ctx);
-    expect(rows).toHaveLength(2);
-    expect(rows[0]!.id).toBe('patreon/90822862/147648418/0');
-    expect(rows[0]!.ext).toBe('mp4');
-    expect(rows[0]!.isVideo).toBe(true);
-    expect(rows[0]!.fileUrl).toBe('https://kemono.cr/data/e5/01/e50103ae3e5a110a1d0c0613e1032e24d9fcddc666027bfa2dffc24a35873e3b.mp4?f=593089088.mp4');
-    expect(rows[0]!.postUrl).toBe('https://kemono.cr/patreon/user/90822862/post/147648418');
-    expect(rows[0]!.md5).toBe('e50103ae3e5a110a1d0c0613e1032e24d9fcddc666027bfa2dffc24a35873e3b');
-    expect(rows[1]!.id).toBe('patreon/90822862/147648418/1');
-    expect(rows[1]!.previewUrl).toContain('/thumbnail/data/5e/ed/');
-    expect(rows[1]!.artistTags).toEqual(['90822862']);
-    expect(rows[1]!.description).toBe('Christmas Livestream');
-  });
-
-  it('parses the live listing envelope and computes hasMore from count', () => {
-    const result = kemonoAdapter.parseSearchResponse(httpSnapshot({ count: 50000, true_count: 21780789, posts: [kemonoPost, { ...kemonoPost, id: '2', file: {}, attachments: [] }] }), { page: 1 }, ctx);
-    expect(result.posts).toHaveLength(2); // second post has no files → no rows
-    expect(result.totalCount).toBe(50000);
-    expect(result.hasMore).toBe(true);
-    expect(result.limit).toBe(50);
-  });
-
-  it('fetches a single post and selects the attachment index', () => {
-    const request = kemonoAdapter.buildPostRequest(ctx, 'patreon/90822862/147648418/1');
-    expect(request.url).toBe('https://kemono.cr/api/v1/patreon/user/90822862/post/147648418');
-    const envelope = { post: kemonoPost, attachments: kemonoPost.attachments, previews: [] };
-    expect(kemonoAdapter.parsePostResponse(httpSnapshot(envelope), 'patreon/90822862/147648418/1', ctx).ext).toBe('png');
-    expect(kemonoAdapter.parsePostResponse(httpSnapshot(kemonoPost), 'patreon/90822862/147648418', ctx).ext).toBe('mp4');
-    expect(() => kemonoAdapter.parsePostResponse(httpSnapshot(envelope), 'patreon/90822862/147648418/9', ctx)).toThrow(/no file #9/);
-    expect(() => kemonoAdapter.buildPostRequest(ctx, '123')).toThrow(BooruError);
-  });
-
-  it('detects creator and post routes on all Kemono domains', () => {
-    expect(kemonoAdapter.matchRoute('https://kemono.cr/patreon/user/90822862/post/147648418')).toMatchObject({ kind: 'post', postId: 'patreon/90822862/147648418' });
-    expect(kemonoAdapter.matchRoute('https://kemono.su/patreon/user/90822862?o=100')).toMatchObject({ kind: 'search', tags: 'patreon/90822862', page: 3 });
-    expect(kemonoAdapter.matchRoute('https://kemono.cr/posts?tag=furry')).toMatchObject({ kind: 'search', tags: 'tag:furry' });
-    expect(kemonoAdapter.matchRoute('https://coomer.st/onlyfans/user/x')).toBeNull();
-    expect(kemonoAdapter.postUrl('https://kemono.cr', 'patreon/1/2/0')).toBe('https://kemono.cr/patreon/user/1/post/2');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Pawchive (Kemono successor) - live shape captured 2026-09-29
-// ---------------------------------------------------------------------------
-
-describe('Pawchive adapter (Kemono-compatible)', () => {
-  const pawchivePost = {
-    id: '12674481',
-    user: '1245946',
-    service: 'fanbox',
-    title: '～種子保管協定２話～',
-    substring: '',
-    published: '2026-09-29T00:14:01',
-    file: { name: 'cover.jpeg', node: 2, path: '/d0/fe/d0fedede6a3c6d0214a20644274bd342f10893ce29c8b91387d815cca162e1aa.jpeg' },
-    attachments: [
-      { name: 'cDnbOfrM3ho34JXkCqef2LL3.png', node: 2, path: '/8f/1c/8f1c17ead27c7b76f7fa12929b8c37105f1b8f7a65e404064ad6272449dfba42.png' },
-      { name: 'IMG_8757.PNG', path: '/e4/fd/e4fd3af4f94d4532ff9a1d5dd0079af263f9bb8e6fdd128af365838200653cbf.png', preview_only: true },
-    ],
-    preview_state: 'scraped',
-    has_full: true,
-    origin: 'import',
-  };
-
-  it('is registered and claims both the old and new domain', async () => {
-    const { pawchiveAdapter } = await import('../../src/adapters/kemono.js');
-    expect(pawchiveAdapter.matchRoute('https://pawchive.pw/fanbox/user/1245946/post/12674481')).toMatchObject({ kind: 'post', postId: 'fanbox/1245946/12674481' });
-    expect(pawchiveAdapter.matchRoute('https://pawchive.st/patreon/user/8762407')).toMatchObject({ kind: 'search', tags: 'patreon/8762407' });
-    expect(pawchiveAdapter.matchRoute('https://kemono.cr/patreon/user/1')).toBeNull();
-  });
-
-  it('parses the bare-array listing and resolves per-node file hosts + img thumbnails', async () => {
-    const { pawchiveAdapter } = await import('../../src/adapters/kemono.js');
-    const ctx = ctxFor(pawchiveAdapter);
-    const result = pawchiveAdapter.parseSearchResponse(httpSnapshot([pawchivePost]), { page: 1 }, ctx);
-    expect(result.posts).toHaveLength(3);
-    expect(result.totalCount).toBeNull();
-    expect(result.posts[0]!.fileUrl).toBe('https://n2.pawchive.pw/data/d0/fe/d0fedede6a3c6d0214a20644274bd342f10893ce29c8b91387d815cca162e1aa.jpeg?f=cover.jpeg');
-    expect(result.posts[0]!.previewUrl).toBe('https://img.pawchive.pw/thumbnail/data/d0/fe/d0fedede6a3c6d0214a20644274bd342f10893ce29c8b91387d815cca162e1aa.jpeg');
-    // Files without a node hint fall back to node 1; preview-only files are flagged in the description.
-    expect(result.posts[2]!.fileUrl.startsWith('https://n1.pawchive.pw/data/')).toBe(true);
-    expect(result.posts[2]!.description).toMatch(/\[preview only\]$/);
-    expect(result.posts[0]!.postUrl).toBe('https://pawchive.pw/fanbox/user/1245946/post/12674481');
-  });
-
-  it('parses the flat single-post shape with Postgres-array tags', async () => {
-    const { pawchiveAdapter } = await import('../../src/adapters/kemono.js');
-    const ctx = ctxFor(pawchiveAdapter);
-    const post = pawchiveAdapter.parsePostResponse(httpSnapshot({ ...pawchivePost, tags: '{キヴォトスの種子保管協定}', content: '…' }), 'fanbox/1245946/12674481/1', ctx);
-    expect(post.ext).toBe('png');
-    expect(post.tags).toEqual(['キヴォトスの種子保管協定']);
-    expect(post.fileUrl).toContain('n2.pawchive.pw');
-  });
-
-  it('keeps kemono.cr on the site host for files (no node field)', () => {
-    const rows = expandKemonoPost(kemonoPostFixture(), ctxFor(kemonoAdapter));
-    expect(rows[0]!.fileUrl.startsWith('https://kemono.cr/data/')).toBe(true);
-    expect(rows[0]!.previewUrl.startsWith('https://kemono.cr/thumbnail/data/') || rows[0]!.previewUrl === rows[0]!.fileUrl).toBe(true);
-  });
-});
-
-function kemonoPostFixture() {
-  return {
-    id: '1',
-    user: '2',
-    service: 'patreon',
-    title: 't',
-    published: '2026-01-01T00:00:00',
-    file: { name: 'a.mp4', path: '/aa/bb/aabb.mp4' },
-    attachments: [],
-  };
-}

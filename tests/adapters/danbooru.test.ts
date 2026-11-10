@@ -92,12 +92,13 @@ describe('Danbooru adapter - parsing', () => {
     expect(normalized.sampleUrl).toContain('/sample/');
   });
 
-  it('falls back to sample/preview URLs when file_url is missing (blocked posts)', () => {
+  it('keeps samples for display but does not substitute them for a missing original', () => {
     const normalized = danbooruAdapter.normalizePost(
       { id: 5, rating: 'g', file_url: null, large_file_url: 'https://cdn.donmai.us/sample/x.jpg', file_ext: 'jpg' },
       context(),
     ) as BooruPost;
-    expect(normalized.fileUrl).toContain('/sample/');
+    expect(normalized.fileUrl).toBe('');
+    expect(normalized.sampleUrl).toContain('/sample/');
   });
 
   it('parses list responses', () => {

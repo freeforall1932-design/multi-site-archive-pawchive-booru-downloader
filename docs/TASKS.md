@@ -9,6 +9,13 @@ Status: **v1 implemented** (see `src/core/tasks.ts`, `src/core/task-store.ts`,
 The parts marked *parked* are decisions, not omissions — they need more than a UI
 to be honest.
 
+**Current limitation:** `done` means Chrome reported completion, not that file
+contents were hashed, the response was genuine media, or the file still exists.
+Interrupted transfers are failures; old start-only records and lost browser IDs
+are unverified. Known Mega/Drive and other share pages are open/export-only;
+provider resolution and decryption are not implemented. Unknown interstitials can
+still be saved as HTML. Exported URLs may contain private fragment keys.
+
 ---
 
 ## 1. The analogy, restated precisely
@@ -22,8 +29,9 @@ Read as a specification, that is a **job manifest + job view + job-level
 controls**, with the concrete behaviours the user then named:
 
 - *traceable* — the task remembers **artist, service, site, post** for every file;
-- *re-runnable* — pressing Download again must fetch **new posts and failed files
-  only**, never re-download what is already on disk;
+- *re-runnable* — collect/rescan for new links, then download missing or failed
+  entries without re-queueing browser-confirmed completions. The extension cannot
+  verify what still exists on disk; unverified starts can duplicate a file;
 - *stateful per file* — `done` / `failed` / `queued` / `new`, with the saved
   filename and any error, so "complete", "partial success" and "failed" are
   distinguishable at the task level;
@@ -59,7 +67,7 @@ The manifest format is versioned (`format: "booru-server-manager.task"`,
 | Option | Behaviour | Verdict |
 | --- | --- | --- |
 | (a) Always idle | Task lands paused with a Start button. | **Chosen default.** Nobody's bandwidth or a volunteer site's rate limit should be spent because a file was opened. |
-| (b) Always auto-start | Like a torrent client with auto-start. | Rejected as a default; available as the existing **Start downloading immediately** setting. |
+| (b) Always auto-start | Like a torrent client with auto-start. | Rejected on import. The **Start downloading immediately** setting only controls whether the queue starts after an explicit Download missing action. |
 | (c) Ask every time | A prompt. | Parked: a prompt on import is noise once (a) and (b) are both reachable from settings. |
 | **(d) Idle + explicit Start/Pause (user's answer)** | Lands idle; one button starts everything missing; Pause returns it to idle and can be resumed later. | **Chosen.** Pause cancels the task's pending queue rows, so "paused" means paused — the files already saved stay saved, and Start later picks up exactly where it stopped. |
 
@@ -88,19 +96,20 @@ stable key, so re-importing the same package, or collecting the same creator
 again, **merges into the existing task** instead of duplicating it.
 
 **Per-file state** lives in the existing link store (`bsm.links`): `new`,
-`queued`, `done` (with filename + bytes), `failed` (with the error). The task
-holds the member ids, which is what keeps a re-scan idempotent.
+`queued` (including browser transfers in progress), `done` (Chrome reported
+complete), `failed` (start or transfer error), and `unverified` (old start or
+missing browser record). The task holds the member ids, keeping rescans idempotent.
 
 **What "Download missing" queues** (`planTaskRun`): every member that is not
-`done` — i.e. `new` **and** `failed` (a retry is the same button). `done` members
+`done` — i.e. `new`, `failed` **and** `unverified` (a retry is the same button;
+check unverified files in Chrome first to avoid duplicates). `done` members
 are never re-queued unless the user asks for a full re-run (`mode: 'all'`, which
 still honours the "if the file exists" download setting).
 
-**Completion classification** (`taskCompletion`): `complete` (every member done) ·
-`partial` (some done, some failed) · `failed` (none done, some failed) ·
-`in-progress` (something is queued) · `empty` (nothing collected yet) — so
-"complete download / partial success / fail" is answerable at a glance, which is
-what the user asked for.
+**Transfer-state classification** (`taskCompletion`): `complete` (every member
+reported complete by Chrome) · `partial` (some complete, others not) · `failed`
+(none complete, some failed) · `in-progress` (something queued or downloading) ·
+`idle` · `empty`. These are browser outcomes, not file-content verification.
 
 **Re-run strategy for new posts** — *Rescan*: re-lists the creator through the
 site API, scans only posts it has not scanned before (or whose links are not
@@ -118,18 +127,18 @@ by extension, and accepts:
   filename, or unfiled links when there is no creator to name it after.
 
 **Pause = cancel pending rows of this task.** Running downloads are never killed
-mid-file; the task returns to `idle` and its `queued` members fall back to `new`,
-so Start later resumes exactly the remaining work.
+mid-file; waiting members fall back to `new`, while an active transfer remains
+tracked and may keep the task in progress. Start later queues the remaining work.
 
 ## 4. Parked ideas (kept deliberately)
 
 | Idea | Why it is parked |
 | --- | --- |
-| **Content hashes / piece verification** | A `.torrent` can verify pieces because the swarm has the data. Here the only authority is the hosting page: Drive/Mega links are opaque, and the booru rarely publishes a hash of the *mirrored* file (Kemono-family posts do publish a SHA-256 for the site's own copy, which the adapter already surfaces). Real verification needs a resolver per provider — a project of its own. Until then the manifest carries `bytes`/`filename` as *observations*, never as proof. |
+| **Content hashes / piece verification** | A `.torrent` can verify pieces because the swarm has the data. Here the only authority is the hosting page: Drive/Mega links are opaque, and the booru rarely publishes a hash of the *mirrored* file (Pawchive posts can publish a SHA-256 for the site's own copy, which the adapter already surfaces). Real verification needs a resolver per provider — a project of its own. Until then the manifest carries `bytes`/`filename` as *observations*, never as proof. |
 | **Per-file pre-known size / total size** | Providers only reveal the size during the download. A task therefore shows `files 3/6` immediately and a size only for files that have finished (or when a site reports it). Showing a fabricated total would be dishonest. |
 | **Task-level scheduling** (start at a time, per-task concurrency, queue of tasks) | Needs the queue to gain task-aware priorities; the current per-server rate limiter already covers the "slowly" requirement. |
 | **Task sharing beyond a file** (a swarm, magnets, a server) | Out of scope on principle: the extension has no backend, and the request rate belongs to each user. |
-| **Tasks for non-archive sites** | A tag search ("all `artist_x` posts on e621") could be a task too. The task model is site-agnostic already; only the UI's collect flow assumes creator archives. |
+| **Tasks for non-archive sites** | A tag search ("all `artist_x` posts on e621") could be a task too. The task model is site-agnostic already; only the UI's collect flow assumes Pawchive. |
 | **A 6th tab / queue lens** | See 2.4 — revisit if the task list grows its own vocabulary. |
 
 ## 5. Data model (for implementers)
@@ -147,5 +156,6 @@ TaskRun { id, startedAt, finishedAt, scannedPosts, added, queued, done, failed, 
 ```
 
 Storage: `bsm.tasks` (`src/core/task-store.ts`), next to `bsm.links`, `bsm.queue`,
-`bsm.history`. Nothing in a task or a manifest is secret: it is the same
-information the panel shows.
+`bsm.history`. Tasks and manifests can contain private share URLs, bearer tokens
+and Mega decryption fragments. Treat exports as sensitive even if the same URLs
+are visible in the panel.
